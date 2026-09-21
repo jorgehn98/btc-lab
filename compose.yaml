@@ -13,6 +13,11 @@ x-engine: &engine
     TZ: UTC
     PYTHONDONTWRITEBYTECODE: "1"
     LAB_STORAGE: /lab-storage
+    NUMEXPR_NUM_THREADS: "1"
+    NUMEXPR_MAX_THREADS: "1"
+    OPENBLAS_NUM_THREADS: "1"
+    OMP_NUM_THREADS: "1"
+    MKL_NUM_THREADS: "1"
   tmpfs:
     - /tmp:rw,nosuid,nodev,size=256m
   volumes:

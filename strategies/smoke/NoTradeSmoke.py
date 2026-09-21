@@ -14,7 +14,7 @@ from freqtrade.strategy import IStrategy
 class NoTradeSmoke(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = "5m"
-    # ROI inalcanzable: el smoke nunca entra, así que nunca sale.
+    # El ROI no interviene: el smoke nunca abre una operación.
     minimal_roi = {"0": 100.0}
     stoploss = -0.10
     can_short = False

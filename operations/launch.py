@@ -3,9 +3,10 @@
 `prepare-smoke` corre en el host: preflight con worktree Git limpio real,
 `docker image inspect` real (digest fijado) y hashes de config/estrategia/
 launcher/health; devuelve la ruta del manifiesto único (sin alias mutable).
-`version` y `smoke` corren en el contenedor: `smoke` lee el manifiesto
-explícito en `/lab-storage/active-input.json` (bind RO de `LAB_SMOKE_INPUT`,
-fijado antes del `up` y conservado en restarts).
+`version` y `smoke` corren en el contenedor. `smoke` lee el manifiesto
+explícito que Compose monta en `/lab-storage/active-input.json` desde la ruta
+única seleccionada por `LAB_SMOKE_INPUT`; esa ruta se fija antes del `up` y el
+fichero se monta en solo lectura.
 
 Solo stdlib, sin `shell=True`, sin flags arbitrarios ni segunda config.
 Las señales SIGTERM/SIGINT se propagan al hijo (sin Freqtrade huérfano).
@@ -48,8 +49,8 @@ TOP_REQUIRED = frozenset({
     "stake_currency", "stake_amount", "max_open_trades", "timeframe",
     "strategy", "api_server", "telegram", "fee",
 })
-# Opciones imprescindibles del schema real: opcionales solo porque los
-# fixtures de test no las traen (defaults seguros); el runtime las exige.
+# El validador local permite omitir estas opciones porque los fixtures de test
+# no las traen; el schema de la imagen fijada solo se comprueba en su runtime.
 TOP_ALLOWED = TOP_REQUIRED | {"entry_pricing", "exit_pricing", "initial_state", "internals"}
 PRICING_PIN = {
     "price_side": "same",
@@ -59,10 +60,10 @@ PRICING_PIN = {
 }
 INITIAL_STATE_PIN = "running"
 INTERNALS_PIN = {"heartbeat_interval": 60}
-# El schema real exige estas claves aunque el servicio esté desactivado;
-# se fijan vacías/cerradas (sin credenciales, sin escucha). La forma corta
-# {"enabled": False} solo se acepta por compatibilidad con fixtures RED:
-# el gate de schema real la bloquea antes de ejecutar.
+# El schema de la imagen fijada exige estas claves aunque el servicio esté
+# desactivado; se fijan vacías/cerradas (sin credenciales, sin escucha). La
+# forma corta {"enabled": False} solo se permite para fixtures RED y no
+# demuestra que la configuración pase el schema real del runtime.
 API_PIN = {
     "enabled": False,
     "listen_ip_address": "127.0.0.1",
@@ -293,10 +294,10 @@ def _atomic_create_new(path: Path, payload: dict) -> None:
 
 
 def _validate_real_schema(config: dict) -> None:
-    """Schema Freqtrade real antes de ejecutar; en host sin lib se omite.
+    """Valida el schema disponible; sin la librería local se omite.
 
-    El gate efectivo corre en el contenedor (misma imagen fijada), donde la
-    librería sí existe. Fuera de ahí no hay motor que validar.
+    El gate autoritativo corre en el contenedor con la imagen fijada, donde la
+    librería está disponible; una validación en el host no sustituye ese gate.
     """
     try:
         from freqtrade.configuration.config_validation import validate_config_schema

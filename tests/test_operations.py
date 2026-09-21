@@ -7,8 +7,8 @@ validate_config: canonica = configs/smoke.json (pares en
   FREQTRADE__* antes de subprocess.
 prepare_smoke: Git limpio + docker image inspect reales (mocks
   realistas); expected_command de contenedor; image_ref mutable
-  rechazado; cada prepare devuelve una ruta unica e inmutable (sin
-  active.json: Compose fija LAB_SMOKE_INPUT a la ruta unica al up).
+  rechazado; cada prepare devuelve una ruta unica e inmutable (Compose monta
+  la ruta elegida por LAB_SMOKE_INPUT como input explícito al hacer up).
 run_smoke: lee la ruta unica; revalida hashes incl. launch_hash/health_hash (tamper
   bloquea Popen); Popen con env limpio; runs/ solo run-*.json, id
   unica, sin sobrescribir; parcial/ausente nunca es exito.
@@ -84,7 +84,7 @@ def _write_tree(root):
 
 @contextlib.contextmanager
 def _git_image(git="clean", image="present"):
-    """Stdout realista a CUALQUIER consulta git/docker (sin imponer flags)."""
+    """Simula las respuestas de las consultas Git/Docker del launcher."""
     def fake_run(argv, **kwargs):
         head = argv[0] if isinstance(argv, list) and argv else ""
         text = " ".join(argv) if isinstance(argv, list) else str(argv)
