@@ -9,9 +9,16 @@ prepare_smoke: Git limpio + docker image inspect reales (mocks
   realistas); expected_command de contenedor; image_ref mutable
   rechazado; cada prepare devuelve una ruta unica e inmutable (Compose monta
   la ruta elegida por LAB_SMOKE_INPUT como input explícito al hacer up).
-run_smoke: lee la ruta unica; revalida hashes incl. launch_hash/health_hash (tamper
-  bloquea Popen); Popen con env limpio; runs/ solo run-*.json, id
-  unica, sin sobrescribir; parcial/ausente nunca es exito.
+run_smoke: CLI smoke sin --code-root/--storage-root e ignora
+  LAB_CODE_ROOT/LAB_STORAGE_ROOT/LAB_STORAGE; main llama con
+  (CONTAINER_CODE, CONTAINER_STORAGE). run_smoke RECHAZA roots que no
+  resuelvan al contenedor antes de leer inputs. Popen argv ==
+  container_command() exacto. exit 130 espontaneo o auto-SIGTERM del
+  hijo (sin senal al padre) => FAILED, nunca CANCELLED falso; SIGTERM
+  recibida por el launcher y reenviada al hijo => CANCELLED 130.
+  Revalida hashes incl. launch_hash/health_hash (tamper bloquea Popen); Popen con
+  env limpio; runs/ solo run-*.json, id unica, sin sobrescribir;
+  parcial/ausente nunca es exito.
 evaluate_health: solo heartbeat autentico, >= StartedAt, no futuro,
   180 s; inspect incompleto (OOM/Status/StartedAt/restarts), NaN,
   causan no-healthy con motivo.
@@ -21,8 +28,11 @@ Run: python -m unittest discover -s tests -v (raiz del worktree).
 import contextlib
 import hashlib
 import json
+import os
+import signal
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -137,6 +147,28 @@ def _runs(store):
     return sorted((Path(store) / "runs").glob("run-*.json"))
 
 
+@contextlib.contextmanager
+def _roots(code, store):
+    """Fija el contenedor a la fixture: argv y validacion, misma fuente."""
+    with mock.patch.object(launch, "CONTAINER_CODE", str(code)), \
+            mock.patch.object(launch, "CONTAINER_STORAGE", str(store)), \
+            mock.patch.object(launch, "CONTAINER_USERDATA", str(Path(store) / "user_data")):
+        yield
+
+
+def _real_smoke(script):
+    """Ejecuta run_smoke con un proceso controlado real (sin mock Popen)."""
+    with tempfile.TemporaryDirectory() as code, tempfile.TemporaryDirectory() as store:
+        _write_tree(code)
+        with _roots(code, store), \
+                mock.patch.object(launch, "container_command", return_value=script), \
+                _git_image():
+            manifest_in = launch.prepare_smoke(code, store, PINNED_IMAGE)
+            rc = launch.run_smoke(code, store, manifest_in)
+            payload = json.loads(_runs(store)[-1].read_text(encoding="utf-8"))
+    return rc, payload
+
+
 class LaunchCase(unittest.TestCase):
     def test_canonical_accepted(self):
         launch.validate_config(_canonical_config(), {})
@@ -185,16 +217,6 @@ class LaunchCase(unittest.TestCase):
         for env in ({"FREQTRADE__DRY_RUN": "false"}, {"FREQTRADE__STRATEGY": "X"}):
             with self.subTest(env=env), self.assertRaises(ValueError, msg=str(env)):
                 launch.validate_config(base, env)
-
-    def test_build_pinned_shell_safe(self):
-        with tempfile.TemporaryDirectory(prefix="code dir; rm ") as code, \
-                tempfile.TemporaryDirectory(prefix="store $HOME && ") as store:
-            argv = launch.build_command(code, store)
-            self.assertIsInstance(argv, list)
-            self.assertIn("NoTradeSmoke", argv)
-            self.assertEqual(len([a for a in argv if a.endswith(".json")]), 1, argv)
-            self.assertTrue(any(code in a for a in argv), argv)
-            self.assertTrue(any(store in a for a in argv), argv)
 
     def test_file_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -259,37 +281,38 @@ class LaunchCase(unittest.TestCase):
     def test_run_failure_partial_never_success(self):
         with tempfile.TemporaryDirectory() as code, tempfile.TemporaryDirectory() as store:
             _write_tree(code)
-            with _git_image():
+            with _roots(code, store), _git_image():
                 manifest_in = launch.prepare_smoke(code, store, PINNED_IMAGE)
-            proc = _fake_popen(3)
-            with mock.patch.object(launch.subprocess, "Popen", return_value=proc) as popen:
-                self.assertEqual(launch.run_smoke(code, store, manifest_in), 3)
-            _, kwargs = popen.call_args
-            self.assertFalse(kwargs.get("shell", False))
-            self.assertEqual([k for k in (kwargs.get("env", {}) or {}) if k.startswith("FREQTRADE__")], [])
-            payload = json.loads(_runs(store)[-1].read_text(encoding="utf-8"))
-            self.assertEqual(payload["exit_code"], 3)
-            self.assertEqual(str(payload["status"]).upper(), "FAILED")
-            with mock.patch.object(launch.subprocess, "Popen", side_effect=OSError("boom")), \
-                    self.assertRaises(Exception):
-                launch.run_smoke(code, store, manifest_in)
-            with mock.patch.object(launch, "_module_hash", return_value="0" * 64), \
-                    mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)) as popen3, \
-                    self.assertRaises(ValueError):
-                launch.run_smoke(code, store, manifest_in)
-            self.assertFalse(popen3.called, "launch/health alterados frenan antes del Popen")
-            (Path(code) / "configs" / "smoke.json").write_bytes(b'{"tampered": true}')
-            with mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)) as popen2, \
-                    self.assertRaises((ValueError, RuntimeError, SystemExit)):
-                launch.run_smoke(code, store, manifest_in)
-            self.assertFalse(popen2.called, "config alterada frena antes del Popen")
-            self.assertFalse([p for p in _runs(store)
-                              if str(json.loads(p.read_text(encoding="utf-8")).get("status", "")).upper() == "SUCCEEDED"])
+                proc = _fake_popen(3)
+                with mock.patch.object(launch.subprocess, "Popen", return_value=proc) as popen:
+                    self.assertEqual(launch.run_smoke(code, store, manifest_in), 3)
+                self.assertEqual(popen.call_args[0][0], launch.container_command())
+                _, kwargs = popen.call_args
+                self.assertFalse(kwargs.get("shell", False))
+                self.assertEqual([k for k in (kwargs.get("env", {}) or {}) if k.startswith("FREQTRADE__")], [])
+                payload = json.loads(_runs(store)[-1].read_text(encoding="utf-8"))
+                self.assertEqual(payload["exit_code"], 3)
+                self.assertEqual(str(payload["status"]).upper(), "FAILED")
+                with mock.patch.object(launch.subprocess, "Popen", side_effect=OSError("boom")), \
+                        self.assertRaises(Exception):
+                    launch.run_smoke(code, store, manifest_in)
+                with mock.patch.object(launch, "_module_hash", return_value="0" * 64), \
+                        mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)) as popen3, \
+                        self.assertRaises(ValueError):
+                    launch.run_smoke(code, store, manifest_in)
+                self.assertFalse(popen3.called, "launch/health alterados frenan antes del Popen")
+                (Path(code) / "configs" / "smoke.json").write_bytes(b'{"tampered": true}')
+                with mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)) as popen2, \
+                        self.assertRaises((ValueError, RuntimeError, SystemExit)):
+                    launch.run_smoke(code, store, manifest_in)
+                self.assertFalse(popen2.called, "config alterada frena antes del Popen")
+                self.assertFalse([p for p in _runs(store)
+                                  if str(json.loads(p.read_text(encoding="utf-8")).get("status", "")).upper() == "SUCCEEDED"])
 
     def test_run_never_overwrites_input_immutable(self):
         with tempfile.TemporaryDirectory() as code, tempfile.TemporaryDirectory() as store:
             _write_tree(code)
-            with _git_image():
+            with _roots(code, store), _git_image():
                 first = launch.prepare_smoke(code, store, PINNED_IMAGE)
                 frozen = Path(first).read_bytes()
                 with mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)):
@@ -304,6 +327,86 @@ class LaunchCase(unittest.TestCase):
             self.assertGreaterEqual(len(runs), 2, runs)
             ids = [json.loads(p.read_text(encoding="utf-8")).get("run_id") or p.name for p in runs]
             self.assertEqual(len(set(ids)), len(ids))
+
+    def test_cli_smoke_sin_roots_ni_env(self):
+        with tempfile.TemporaryDirectory() as code, tempfile.TemporaryDirectory() as store, \
+                tempfile.TemporaryDirectory() as other:
+            _write_tree(code)
+            _write_tree(other)
+            with _git_image():
+                manifest_real = launch.prepare_smoke(code, store, PINNED_IMAGE)
+            with mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)):
+                with self.assertRaises(SystemExit):
+                    launch.main(["smoke", "--code-root", other, "--storage-root", store,
+                                 "--input", manifest_real])
+            with _roots(code, store), _git_image():
+                manifest_fx = launch.prepare_smoke(code, store, PINNED_IMAGE)
+            bogus = {"LAB_CODE_ROOT": "/bogus/code", "LAB_STORAGE_ROOT": "/bogus/store",
+                     "LAB_STORAGE": "/bogus/lab"}
+            with _roots(code, store), mock.patch.dict(os.environ, bogus), \
+                    mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)) as popen:
+                try:
+                    rc = launch.main(["smoke", "--input", manifest_fx])
+                except Exception as exc:
+                    self.fail(f"RED: env redirige paths de smoke: {exc!r}")
+                self.assertEqual(rc, 0)
+                argv = popen.call_args[0][0]
+                self.assertEqual(argv, launch.container_command())
+                self.assertNotIn("/bogus", " ".join(argv))
+
+    def test_run_roots_mismatch_falla_antes_popen(self):
+        with tempfile.TemporaryDirectory() as code_a, tempfile.TemporaryDirectory() as code_b, \
+                tempfile.TemporaryDirectory() as store_a, tempfile.TemporaryDirectory() as store_b:
+            _write_tree(code_a)
+            _write_tree(code_b)
+            with _git_image():
+                manifest_in = launch.prepare_smoke(code_a, store_a, PINNED_IMAGE)
+            for label, c, s in [("code", code_b, store_a), ("storage", code_a, store_b)]:
+                with self.subTest(label=label), \
+                        mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)) as popen, \
+                        self.assertRaises((ValueError, RuntimeError, SystemExit), msg=label):
+                    launch.run_smoke(c, s, manifest_in)
+                self.assertFalse(popen.called, label)
+
+    def test_exit130_espontaneo_es_failed(self):
+        rc, payload = _real_smoke([sys.executable, "-c", "import sys; sys.exit(130)"])
+        self.assertEqual(rc, 130)
+        self.assertEqual(payload["exit_code"], 130)
+        self.assertEqual(str(payload["status"]).upper(), "FAILED")
+
+    def test_child_self_sigterm_es_failed(self):
+        script = [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"]
+        rc, payload = _real_smoke(script)
+        self.assertEqual(rc, -signal.SIGTERM)
+        self.assertEqual(payload["exit_code"], -signal.SIGTERM)
+        self.assertEqual(str(payload["status"]).upper(), "FAILED")
+
+    def test_parent_sigterm_forwarded_es_cancelled(self):
+        proc = _fake_popen(130)
+        proc.poll.return_value = None
+        fired = []
+
+        def _wait(timeout=None):
+            if not fired:
+                fired.append(True)
+                os.kill(os.getpid(), signal.SIGTERM)
+                deadline = time.monotonic() + 5.0
+                while not proc.send_signal.called and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            return 130
+
+        proc.wait.side_effect = _wait
+        with tempfile.TemporaryDirectory() as code, tempfile.TemporaryDirectory() as store:
+            _write_tree(code)
+            with _roots(code, store), _git_image():
+                manifest_in = launch.prepare_smoke(code, store, PINNED_IMAGE)
+                with mock.patch.object(launch.subprocess, "Popen", return_value=proc):
+                    rc = launch.run_smoke(code, store, manifest_in)
+                payload = json.loads(_runs(store)[-1].read_text(encoding="utf-8"))
+        proc.send_signal.assert_called_once_with(signal.SIGTERM)
+        self.assertEqual(rc, 130)
+        self.assertEqual(payload["exit_code"], 130)
+        self.assertEqual(str(payload["status"]).upper(), "CANCELLED")
 
 
 class HealthCase(unittest.TestCase):
@@ -325,29 +428,29 @@ class HealthCase(unittest.TestCase):
         no_restarts = {"State": dict(full)}
         bad_started = {"State": {**full, "StartedAt": "nonsense"}, "RestartCount": 0}
         cases = {
-            "detenido": (_inspect(started, running=False), fresh, 50 * 1024**3),
-            "stale": (_inspect(started), _heartbeat(now - timedelta(seconds=600)), 50 * 1024**3),
-            "futuro": (_inspect(started), _heartbeat(now + timedelta(seconds=60)), 50 * 1024**3),
-            "no-heartbeat": (_inspect(started), "", 50 * 1024**3),
-            "reciente-no-heartbeat": (_inspect(started), _other_line(now - timedelta(seconds=30)), 50 * 1024**3),
-            "fecha-cualquiera-no-prueba": (_inspect(started), f"{(now - timedelta(seconds=30)).isoformat()} engine heartbeat\n", 50 * 1024**3),
-            "heartbeat-previo-a-StartedAt": (_inspect(now - timedelta(seconds=60)), _heartbeat(now - timedelta(seconds=120)), 50 * 1024**3),
-            "oom": (_inspect(started, oom=True), fresh, 50 * 1024**3),
-            "oom-ausente": (no_oom, fresh, 50 * 1024**3),
-            "status-ausente": (no_status, fresh, 50 * 1024**3),
-            "started-ilegible": (bad_started, fresh, 50 * 1024**3),
-            "restarts": (_inspect(started, restarts=2), fresh, 50 * 1024**3),
-            "restarts-ausente": (no_restarts, fresh, 50 * 1024**3),
-            "disco-0": (_inspect(started), fresh, 0),
-            "espacio-nan": (_inspect(started), fresh, float("nan")),
-            "espacio-None": (_inspect(started), fresh, None),
-            "inspect-None": (None, fresh, 50 * 1024**3),
-            "malformado": (_inspect(started), "basura sin formato", 50 * 1024**3),
+            "detenido": (_inspect(started, running=False), fresh, 50 * 1024**3, "unhealthy"),
+            "stale": (_inspect(started), _heartbeat(now - timedelta(seconds=600)), 50 * 1024**3, "unhealthy"),
+            "futuro": (_inspect(started), _heartbeat(now + timedelta(seconds=60)), 50 * 1024**3, "unknown"),
+            "no-heartbeat": (_inspect(started), "", 50 * 1024**3, "unknown"),
+            "reciente-no-heartbeat": (_inspect(started), _other_line(now - timedelta(seconds=30)), 50 * 1024**3, "unknown"),
+            "fecha-cualquiera-no-prueba": (_inspect(started), f"{(now - timedelta(seconds=30)).isoformat()} engine heartbeat\n", 50 * 1024**3, "unknown"),
+            "heartbeat-previo-a-StartedAt": (_inspect(now - timedelta(seconds=60)), _heartbeat(now - timedelta(seconds=120)), 50 * 1024**3, "unhealthy"),
+            "oom": (_inspect(started, oom=True), fresh, 50 * 1024**3, "unhealthy"),
+            "oom-ausente": (no_oom, fresh, 50 * 1024**3, "unhealthy"),
+            "status-ausente": (no_status, fresh, 50 * 1024**3, "unhealthy"),
+            "started-ilegible": (bad_started, fresh, 50 * 1024**3, "unknown"),
+            "restarts": (_inspect(started, restarts=2), fresh, 50 * 1024**3, "unhealthy"),
+            "restarts-ausente": (no_restarts, fresh, 50 * 1024**3, "unknown"),
+            "disco-0": (_inspect(started), fresh, 0, "unhealthy"),
+            "espacio-nan": (_inspect(started), fresh, float("nan"), "unhealthy"),
+            "espacio-None": (_inspect(started), fresh, None, "unknown"),
+            "inspect-None": (None, fresh, 50 * 1024**3, "unknown"),
+            "malformado": (_inspect(started), "basura sin formato", 50 * 1024**3, "unknown"),
         }
-        for label, (insp, log, free) in cases.items():
+        for label, (insp, log, free, expected) in cases.items():
             with self.subTest(label=label):
                 res = health.evaluate_health(insp, log, free, now)
-                self.assertNotEqual(res["status"], "healthy", (label, res))
+                self.assertEqual(res["status"], expected, (label, res))
                 self.assertTrue(res["reasons"], label)
 
 

@@ -3,10 +3,13 @@
 `prepare-smoke` corre en el host: preflight con worktree Git limpio real,
 `docker image inspect` real (digest fijado) y hashes de config/estrategia/
 launcher/health; devuelve la ruta del manifiesto único (sin alias mutable).
-`version` y `smoke` corren en el contenedor. `smoke` lee el manifiesto
-explícito que Compose monta en `/lab-storage/active-input.json` desde la ruta
-única seleccionada por `LAB_SMOKE_INPUT`; esa ruta se fija antes del `up` y el
-fichero se monta en solo lectura.
+`version` y `smoke` corren en el contenedor. `smoke` no acepta roots por
+flag ni entorno: usa siempre CONTAINER_CODE/CONTAINER_STORAGE y `run_smoke`
+rechaza cualquier root que no resuelva a esas constantes antes de leer
+inputs. Lee el manifiesto explícito que Compose monta en
+`/lab-storage/active-input.json` desde la ruta única seleccionada por
+`LAB_SMOKE_INPUT`; esa ruta se fija antes del `up` y el fichero se monta
+en solo lectura.
 
 Solo stdlib, sin `shell=True`, sin flags arbitrarios ni segunda config.
 Las señales SIGTERM/SIGINT se propagan al hijo (sin Freqtrade huérfano).
@@ -39,7 +42,6 @@ STRATEGY_NAME = "NoTradeSmoke"
 CONFIG_REL = Path("configs/smoke.json")
 STRATEGY_REL = Path("strategies/smoke/NoTradeSmoke.py")
 STRATEGY_DIR_REL = Path("strategies/smoke")
-RUNTIME_SUBDIR = Path("runtime/smoke")
 INPUTS_SUBDIR = Path("runs/inputs")
 CONTAINER_ACTIVE_INPUT = "/lab-storage/active-input.json"
 RUNS_SUBDIR = Path("runs")
@@ -164,24 +166,8 @@ def file_hash(path) -> str:
     return digest.hexdigest()
 
 
-def build_command(code_root, storage_root) -> list:
-    """Argv de ejecución con rutas host como datos (lista, sin shell)."""
-    code = Path(code_root)
-    store = Path(storage_root)
-    userdir = store / RUNTIME_SUBDIR
-    return [
-        "freqtrade", "trade",
-        "--config", str(code / CONFIG_REL),
-        "--strategy", STRATEGY_NAME,
-        "--strategy-path", str(code / STRATEGY_DIR_REL),
-        "--userdir", str(userdir),
-        "--db-url", "sqlite:///" + str(userdir / "tradesv3.dryrun.sqlite"),
-        "--logfile", str(userdir / "freqtrade.log"),
-    ]
-
-
 def container_command() -> list:
-    """Argv con rutas reales de contenedor, construido directo (sin replaces)."""
+    """Única fuente del argv (rutas reales de contenedor, sin replaces)."""
     userdir = CONTAINER_USERDATA
     return [
         "freqtrade", "trade",
@@ -351,11 +337,18 @@ def prepare_smoke(code_root, storage_root, image_ref) -> str:
     return str(out)
 
 
-def _run_forwarded(argv: list, env: dict) -> int:
-    """Ejecuta al hijo propagando SIGTERM/SIGINT; devuelve su exit code."""
+def _run_forwarded(argv: list, env: dict) -> tuple:
+    """Ejecuta al hijo propagando SIGTERM/SIGINT.
+
+    Devuelve (exit_code, signum): signum es la señal recibida por el
+    launcher (y reenviada al hijo) o None si no hubo ninguna. La señal se
+    registra en una celda local, sin estado global.
+    """
     proc = subprocess.Popen(argv, env=env)
+    received = []
 
     def _forward(signum, _frame):
+        received.append(signum)
         if proc.poll() is None:
             try:
                 proc.send_signal(signum)
@@ -365,22 +358,54 @@ def _run_forwarded(argv: list, env: dict) -> int:
     old_term = signal.signal(signal.SIGTERM, _forward)
     old_int = signal.signal(signal.SIGINT, _forward)
     try:
-        return proc.wait()
+        return proc.wait(), (received[0] if received else None)
     finally:
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
 
 
+def _require_container_roots(code_root, storage_root) -> tuple:
+    """Resuelve roots y exige las constantes del contenedor antes de leer nada."""
+    code = Path(code_root).resolve()
+    store = Path(storage_root).resolve()
+    if code != Path(CONTAINER_CODE).resolve():
+        raise ValueError(f"code_root fuera del contenedor: {code_root!r}")
+    if store != Path(CONTAINER_STORAGE).resolve():
+        raise ValueError(f"storage_root fuera del contenedor: {store!r}")
+    return code, store
+
+
+def _check_input_manifest(manifest_in: dict) -> None:
+    """Chequeos mínimos del manifiesto de entrada (forma, no contenido)."""
+    if not isinstance(manifest_in, dict):
+        raise ValueError("manifiesto de entrada ilegible: no es un objeto")
+    if manifest_in.get("kind") != "btc-lab-smoke-input":
+        raise ValueError("manifiesto de entrada con kind inesperado")
+    if manifest_in.get("status") != "PREPARED":
+        raise ValueError("manifiesto de entrada no está PREPARED")
+    if manifest_in.get("image_ref") != PINNED_IMAGE:
+        raise ValueError("manifiesto de entrada sin imagen fijada")
+    if not _COMMIT_RE.fullmatch(str(manifest_in.get("commit") or "")):
+        raise ValueError("manifiesto de entrada sin commit válido")
+    if not manifest_in.get("input_id"):
+        raise ValueError("manifiesto de entrada sin input_id")
+
+
 def run_smoke(code_root, storage_root, input_path) -> int:
-    """Revalida hashes contra el input y ejecuta; manifiesto propio atómico."""
-    code = Path(code_root)
-    store = Path(storage_root)
+    """Revalida identidad contra el input y ejecuta; manifiesto propio atómico.
+
+    CANCELLED solo si el launcher recibe SIGTERM/SIGINT y la reenvía (con
+    el exit original); un 130 espontáneo o un auto-SIGTERM del hijo sin
+    señal al padre es FAILED.
+    """
+    code, store = _require_container_roots(code_root, storage_root)
     try:
         manifest_in = json.loads(Path(input_path).read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise
     except (OSError, ValueError) as exc:
         raise ValueError(f"manifiesto de entrada ilegible: {exc}") from exc
+    _check_input_manifest(manifest_in)
 
     config, _ = _load_config(code)
     validate_config(config, os.environ)
@@ -419,17 +444,27 @@ def run_smoke(code_root, storage_root, input_path) -> int:
 
     child_env = {k: v for k, v in os.environ.items() if not k.startswith("FREQTRADE__")}
     try:
-        returncode = _run_forwarded(command, child_env)
+        returncode, signum = _run_forwarded(command, child_env)
     except Exception as exc:
         _atomic_replace(run_path, {
             **base, "status": "FAILED", "exit_code": None,
             "finished_at": _utcnow_iso(), "error": f"{type(exc).__name__}: {exc}",
         })
         raise
-    _atomic_replace(run_path, {
-        **base, "status": "SUCCEEDED" if returncode == 0 else "FAILED",
-        "exit_code": returncode, "finished_at": _utcnow_iso(),
-    })
+    if signum is not None:
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = str(signum)
+        _atomic_replace(run_path, {
+            **base, "status": "CANCELLED", "signal": signame,
+            "exit_code": returncode, "finished_at": _utcnow_iso(),
+        })
+    else:
+        _atomic_replace(run_path, {
+            **base, "status": "SUCCEEDED" if returncode == 0 else "FAILED",
+            "exit_code": returncode, "finished_at": _utcnow_iso(),
+        })
     return returncode
 
 
@@ -444,8 +479,6 @@ def main(argv=None) -> int:
     prep.add_argument("--image", default=PINNED_IMAGE)
 
     smoke = sub.add_parser("smoke", help="ejecuta el smoke (en contenedor)")
-    smoke.add_argument("--code-root", default=os.environ.get("LAB_CODE_ROOT", CONTAINER_CODE))
-    smoke.add_argument("--storage-root", default=os.environ.get("LAB_STORAGE", os.environ.get("LAB_STORAGE_ROOT", CONTAINER_STORAGE)))
     smoke.add_argument("--input", default=os.environ.get("SMOKE_INPUT", CONTAINER_ACTIVE_INPUT))
 
     args = parser.parse_args(argv)
@@ -462,7 +495,7 @@ def main(argv=None) -> int:
     if not args.input:
         print("smoke exige --input con el manifiesto congelado (o SMOKE_INPUT)", file=sys.stderr)
         return 2
-    return run_smoke(args.code_root, args.storage_root, args.input)
+    return run_smoke(CONTAINER_CODE, CONTAINER_STORAGE, args.input)
 
 
 if __name__ == "__main__":

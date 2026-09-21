@@ -22,11 +22,12 @@ La salida debe incluir `docker`. Si la sesión actual todavía no lo carga, abre
 sg docker
 ```
 
-Define las raíces absolutas una vez por shell:
+Define las raíces absolutas una vez por shell y crea los directorios persistentes antes del primer preflight:
 
 ```sh
 export LAB_CODE_ROOT="/home/jorgextech/dev/personal/Crypto Trading Bot/worktrees/btc-lab-foundation"
 export LAB_STORAGE_ROOT="/home/jorgextech/dev/personal/Crypto Trading Bot/storage"
+mkdir -p "$LAB_STORAGE_ROOT/runs/inputs" "$LAB_STORAGE_ROOT/runtime/smoke" "$LAB_STORAGE_ROOT/backups"
 ```
 
 El contenedor usa `/lab-storage` para la raíz de storage y ejecuta como UID/GID `1000:1000`. Los montajes de proyecto llevan la etiqueta SELinux `z`; Fedora permanece en enforcing. Si aparece un aviso cosmético de `sudo chown` del upstream, no desactives el hardening ni `no-new-privileges`: los permisos correctos del UID 1000 son la solución operativa.
@@ -43,9 +44,15 @@ Comprueba la configuración efectiva sin arrancar servicios:
 docker compose --profile smoke config
 ```
 
-El cambio de límites de hilos a `1` ya está en Compose, pero requiere recrear el contenedor para aplicarse al proceso existente. Déjalo para el próximo arranque/recreación; no cambies el runtime activo en esta guía.
+Los límites de hilos `1` son parte permanente del contrato de Compose. Un contenedor ya creado los recibe al recrearse; un arranque nuevo usa el contrato vigente.
 
 ## Preflight, versión y smoke
+
+En una máquina nueva, descarga primero la imagen fijada:
+
+```sh
+docker pull "freqtradeorg/freqtrade:2026.8@sha256:4d23160b501d2b34579e76f57ad75edfa274967cd0dd824ff1c1b86d8c166ab4"
+```
 
 `prepare-smoke` exige un worktree Git limpio y que la imagen fijada esté disponible localmente. También verifica la configuración, la estrategia y los hashes de `launch.py` y `health.py`:
 
@@ -56,6 +63,8 @@ python3 -m operations.launch prepare-smoke \
   --image "freqtradeorg/freqtrade:2026.8@sha256:4d23160b501d2b34579e76f57ad75edfa274967cd0dd824ff1c1b86d8c166ab4"
 ```
 
+Solo `prepare-smoke` acepta `--code-root`/`--storage-root` (o sus variables de host). El subcomando `smoke` no acepta flags ni variables para redirigir esas raíces: dentro del contenedor usa siempre `/opt/btc-lab` y `/lab-storage`.
+
 Comprueba la versión del motor sin mercado ni `up` genérico:
 
 ```sh
@@ -65,10 +74,12 @@ docker compose --profile tools run --rm engine
 Para iniciar un smoke nuevo, prepara el input una sola vez y fija la ruta devuelta en la shell. No uses un alias mutable ni vuelvas a ejecutar `prepare-smoke` al reiniciar:
 
 ```sh
-export LAB_SMOKE_INPUT="$(python3 -m operations.launch prepare-smoke \
+smoke_input="$(python3 -m operations.launch prepare-smoke \
   --code-root "$LAB_CODE_ROOT" \
   --storage-root "$LAB_STORAGE_ROOT" \
-  --image "freqtradeorg/freqtrade:2026.8@sha256:4d23160b501d2b34579e76f57ad75edfa274967cd0dd824ff1c1b86d8c166ab4")"
+  --image "freqtradeorg/freqtrade:2026.8@sha256:4d23160b501d2b34579e76f57ad75edfa274967cd0dd824ff1c1b86d8c166ab4")" || exit $?
+test -f "$smoke_input" || exit 1
+export LAB_SMOKE_INPUT="$smoke_input"
 docker compose --profile smoke up -d smoke
 ```
 
@@ -98,10 +109,12 @@ Rutas persistentes principales:
 | `storage/runs/run-*.json` | resultado de cada arranque |
 | `storage/health.json`, `storage/health.lock` | última salud y lock |
 
+Cada run comienza como `RUNNING`. Una señal `SIGTERM`/`SIGINT` recibida por el launcher y reenviada al hijo termina como `CANCELLED`; un crash o código de salida no cero termina como `FAILED`. Si el proceso muere con `SIGKILL`, el manifiesto puede quedar `RUNNING` e incompleto: nunca se interpreta como éxito.
+
 Para una pausa normal conserva el estado y detén el contenedor:
 
 ```sh
-docker stop btc-lab-smoke-1
+docker stop --timeout 30 btc-lab-smoke-1
 ```
 
 Para reanudar el mismo contenedor, sin Compose, variables ni regenerar el input:
@@ -122,7 +135,7 @@ test -n "$LAB_SMOKE_INPUT" && test -f "$LAB_SMOKE_INPUT"
 No copies `tradesv3.dryrun.sqlite` mientras el motor pueda escribirla. Primero detén el contenedor y verifica que terminó; el siguiente procedimiento usa la API `sqlite3.Connection.backup` de la biblioteca estándar, escribe en `storage/backups/` y restaura en una ruta nueva sin tocar la DB original.
 
 ```sh
-docker stop btc-lab-smoke-1
+docker stop --timeout 30 btc-lab-smoke-1
 export DB="$LAB_STORAGE_ROOT/runtime/smoke/tradesv3.dryrun.sqlite"
 export BACKUP="$LAB_STORAGE_ROOT/backups/tradesv3.dryrun.sqlite"
 export RESTORE="$LAB_STORAGE_ROOT/backups/verify-tradesv3.dryrun.sqlite"
@@ -143,7 +156,6 @@ if restore.exists():
     raise SystemExit(f"la ruta de verificación ya existe, elige otra: {restore}")
 with sqlite3.connect(db) as source, sqlite3.connect(backup) as target:
     source.backup(target)
-    target.execute("PRAGMA integrity_check")
     if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
         raise SystemExit("integrity_check falló en el backup")
 with sqlite3.connect(backup) as source, sqlite3.connect(restore) as target:
@@ -155,13 +167,27 @@ print(f"restauración verificada: {restore}")
 PY
 ```
 
-La restauración solo se verifica en `verify-tradesv3.dryrun.sqlite`, una ruta nueva. No borres, reemplaces ni sobrescribas la DB activa. El backup en el mismo disco protege ante errores operativos, no ante pérdida del disco; aún no existe una réplica externa decidida.
+La restauración solo se verifica en `verify-tradesv3.dryrun.sqlite`, una ruta nueva. La comprobación inicial ya se realizó en `storage/backups/smoke-initial.sqlite` y `storage/backups/smoke-restore-check.sqlite`, ambas con `integrity_check=ok`. No borres, reemplaces ni sobrescribas la DB activa. El backup en el mismo disco protege ante errores operativos, no ante pérdida del disco; aún no existe una réplica externa decidida.
 
 ## Timer de usuario y límites de disponibilidad
 
-Las units versionadas son `operations/systemd/btc-lab-health.service` y `.timer`: una comprobación oneshot cada cinco minutos, `TimeoutStartSec=30`, journald y sin restart automático. El timer todavía **no está instalado**; T05 hará la instalación tras verificar la sesión y el grupo efectivo. No se debe habilitar linger, cambiar suspensión ni convertirlo en un servicio global. Sin linger, el timer solo funciona mientras la sesión de usuario y el PC estén disponibles.
+Las units versionadas son `operations/systemd/btc-lab-health.service` y `.timer`: una comprobación oneshot cada cinco minutos, `TimeoutStartSec=30`, journald y sin restart automático. Ya están enlazadas desde `~/.config/systemd/user`; el grupo `docker` efectivo para systemd está verificado y `Linger=no`. No se debe habilitar linger, cambiar suspensión ni convertirlo en un servicio global. Sin linger, el timer solo funciona mientras la sesión de usuario y el PC estén disponibles.
 
-La instalación futura debe conservar las rutas absolutas con espacios y comprobar primero el grupo `docker`. Para desinstalarla de forma reversible, desactiva el timer de usuario y conserva los ficheros versionados:
+Activa el timer solo como operación explícita y considera la activación confirmada únicamente después de revisar `status`, journal y el JSON de health:
+
+```sh
+systemctl --user link "$LAB_CODE_ROOT/operations/systemd/btc-lab-health.service" \
+  "$LAB_CODE_ROOT/operations/systemd/btc-lab-health.timer"
+systemctl --user daemon-reload
+systemctl --user enable --now btc-lab-health.timer
+systemctl --user start btc-lab-health.service
+systemctl --user status btc-lab-health.timer --no-pager
+systemctl --user status btc-lab-health.service --no-pager
+journalctl --user -u btc-lab-health.service --since "10 minutes ago" --no-pager
+test -f "$LAB_STORAGE_ROOT/health.json" && python3 -m json.tool "$LAB_STORAGE_ROOT/health.json"
+```
+
+Para desinstalarlo de forma reversible, desactiva el timer de usuario y conserva los ficheros versionados:
 
 ```sh
 systemctl --user disable --now btc-lab-health.timer
@@ -170,4 +196,4 @@ systemctl --user reset-failed btc-lab-health.service
 
 ## Estado de Git
 
-El laboratorio es local y no tiene remoto configurado en esta entrega. No hagas `push` ni inventes un destino remoto. Los cambios del worktree deben ser revisables y `prepare-smoke` rechazará un árbol sucio. La habilitación del timer y la verificación operativa desde otra sesión quedan pendientes para T05.
+El laboratorio es local y no tiene remoto configurado en esta entrega. No hagas `push` ni inventes un destino remoto. Los cambios del worktree deben ser revisables y `prepare-smoke` rechazará un árbol sucio. La activación del timer no se considera ejecutada hasta confirmar sus estados, journal y JSON de health.

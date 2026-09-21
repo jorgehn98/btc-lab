@@ -8,4 +8,4 @@ Separar una ventaja reproducible de un resultado histórico afortunado. Esta ent
 
 Está implementado un smoke `dry_run` con `NoTradeSmoke`: BTC/USDT spot, `5m`, sin entradas y con estado, hashes, logs, DB SQLite y comprobación de salud locales. Sus cero operaciones son el comportamiento esperado de la prueba técnica, no una métrica de rentabilidad.
 
-Las operaciones reproducibles, el backup seguro y los límites pendientes están en la [guía del laboratorio local](docs/guides/local-lab.md).
+Las operaciones reproducibles, el backup seguro y la activación del health timer están en la [guía del laboratorio local](docs/guides/local-lab.md).
