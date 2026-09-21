@@ -1,33 +1,26 @@
-"""T02 RED: launcher, manifiesto y health (contrato T03 para implementer).
+"""T02: launcher, manifiesto y health contra API real (T03 implementado).
 
-validate_config(config, environ): solo canonica BTC spot dry-run con
-  pares en exchange.pair_whitelist (Freqtrade real). ValueError + rechazo
-  FREQTRADE__* antes de cualquier subprocess.
-build_command(code_root, storage_root): argv de EJECUCION flexible (rutas
-  host como datos, sin shell); fija unica config + NoTradeSmoke.
-file_hash(path): sha256 hex; FileNotFoundError si falta.
-prepare_smoke(code_root, storage_root, image_ref): preflight host con Git
-  limpio REAL y docker image inspect REAL (sin fallback). expected_command
-  normalizado a contenedor (/opt/btc-lab, /lab-storage, /freqtrade/
-  user_data). Fallo => excepcion, ningun exito.
-run_smoke(code_root, storage_root, input_path): revalida hashes y ejecuta
-  con subprocess.Popen (propaga SIGTERM/SIGINT; senales reales a T05).
-  Manifiesto propio atomico en runs/, id unica, UTC, exit+estado; nunca
-  sobrescribe; parcial/ausente nunca es exito.
-evaluate_health(inspect, log, free_bytes, now): solo vale el heartbeat
-  AUTENTICO 'YYYY-MM-DD HH:MM:SS,mmm - freqtrade.worker - INFO - Bot
-  heartbeat. PID=.. state=RUNNING'; otra fecha no prueba vida; heartbeat
-  < StartedAt no cuenta. Umbral 180 s. {status: healthy|unhealthy|
-  unknown, reasons: [...]}; no-cero salvo healthy.
-RED: import condicional + setUp con fail explicito. Git/imagen via run
-mocks realistas; ejecucion via Popen; reloj controlado; sin red/Docker.
+validate_config: canonica = configs/smoke.json (pares en
+  exchange.pair_whitelist, StaticPairList exacto, pricing/initial_state/
+  internals fijados, api_server desactivado con jwt placeholder publico
+  exacto, telegram con token/chat_id vacios). ValueError + rechazo
+  FREQTRADE__* antes de subprocess.
+prepare_smoke: Git limpio + docker image inspect reales (mocks
+  realistas); expected_command de contenedor; image_ref mutable
+  rechazado; cada prepare devuelve una ruta unica e inmutable (sin
+  active.json: Compose fija LAB_SMOKE_INPUT a la ruta unica al up).
+run_smoke: lee la ruta unica; revalida hashes incl. launch_hash/health_hash (tamper
+  bloquea Popen); Popen con env limpio; runs/ solo run-*.json, id
+  unica, sin sobrescribir; parcial/ausente nunca es exito.
+evaluate_health: solo heartbeat autentico, >= StartedAt, no futuro,
+  180 s; inspect incompleto (OOM/Status/StartedAt/restarts), NaN,
+  causan no-healthy con motivo.
 Run: python -m unittest discover -s tests -v (raiz del worktree).
 """
 
 import contextlib
 import hashlib
 import json
-import os
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -38,40 +31,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import unittest
 from unittest import mock
 
-try:
-    from operations import health
-    _HEALTH_ERR = None
-except Exception as exc:
-    health = None
-    _HEALTH_ERR = exc
-
-try:
-    from operations import launch
-    _LAUNCH_ERR = None
-except Exception as exc:
-    launch = None
-    _LAUNCH_ERR = exc
-
+from operations import health, launch
 
 PINNED_IMAGE = (
     "freqtradeorg/freqtrade:2026.8@sha256:"
     "4d23160b501d2b34579e76f57ad75edfa274967cd0dd824ff1c1b86d8c166ab4"
 )
-COMMIT = "9f3a1c2d4e5b6a7890abcdef1234567890abcdef12"
-IMAGE_ID = "sha256:" + "4d23160b501d2b34579e76f57ad75edfa274967cd0dd824ff1c1b86d8c166ab4"
+COMMIT = "9f3a1c2d4e5b6a7890abcdef1234567890abcde1"
+IMAGE_ID = "sha256:4d23160b501d2b34579e76f57ad75edfa274967cd0dd824ff1c1b86d8c166ab4"
+JWT_PLACEHOLDER = "DISABLED-NO-API-SERVER-PLACEHOLDER-0000"
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _canonical_config():
+    pricing = {"price_side": "same", "use_order_book": False,
+               "order_book_top": 1, "price_last_balance": 0.0}
     return {
-        "exchange": {
-            "name": "binance",
-            "key": "",
-            "secret": "",
-            "password": "",
-            "pair_whitelist": ["BTC/USDT"],
-            "pair_blacklist": [],
-        },
-        "pairlists": [{"method": "StaticPairlist"}],
+        "exchange": {"name": "binance", "key": "", "secret": "", "password": "",
+                     "pair_whitelist": ["BTC/USDT"], "pair_blacklist": []},
+        "pairlists": [{"method": "StaticPairList"}],
         "trading_mode": "spot",
         "dry_run": True,
         "dry_run_wallet": 10000,
@@ -80,8 +58,14 @@ def _canonical_config():
         "max_open_trades": 1,
         "timeframe": "5m",
         "strategy": "NoTradeSmoke",
-        "api_server": {"enabled": False},
-        "telegram": {"enabled": False},
+        "entry_pricing": dict(pricing),
+        "exit_pricing": dict(pricing),
+        "initial_state": "running",
+        "internals": {"heartbeat_interval": 60},
+        "api_server": {"enabled": False, "listen_ip_address": "127.0.0.1",
+                       "listen_port": 8080, "username": "", "password": "",
+                       "jwt_secret_key": JWT_PLACEHOLDER},
+        "telegram": {"enabled": False, "token": "", "chat_id": ""},
         "fee": 0.001,
     }
 
@@ -149,13 +133,15 @@ def _inspect(started_at, restarts=0, oom=False, running=True):
     return {"State": state, "RestartCount": restarts}
 
 
-class LaunchCase(unittest.TestCase):
-    def setUp(self):
-        if launch is None:
-            self.fail(f"RED: operations.launch no implementado ({_LAUNCH_ERR!r})")
+def _runs(store):
+    return sorted((Path(store) / "runs").glob("run-*.json"))
 
+
+class LaunchCase(unittest.TestCase):
     def test_canonical_accepted(self):
         launch.validate_config(_canonical_config(), {})
+        real = json.loads((ROOT / "configs" / "smoke.json").read_text(encoding="utf-8"))
+        launch.validate_config(real, {})
 
     def test_rejects_unsafe(self):
         base = _canonical_config()
@@ -166,10 +152,17 @@ class LaunchCase(unittest.TestCase):
             "futures": {**base, "trading_mode": "futures"},
             "par extra": {**base, "exchange": {**ex, "pair_whitelist": ["BTC/USDT", "ETH/USDT"]}},
             "par distinto": {**base, "exchange": {**ex, "pair_whitelist": ["ETH/USDT"]}},
+            "par top-level invalido": {**base, "pair_whitelist": ["BTC/USDT"]},
+            "pairlists typo": {**base, "pairlists": [{"method": "StaticPairlist"}]},
             "exchange": {**base, "exchange": {**ex, "name": "kraken"}},
             "estrategia": {**base, "strategy": "MyStrategy"},
-            "api": {**base, "api_server": {"enabled": True}},
-            "telegram": {**base, "telegram": {"enabled": True}},
+            "api on": {**base, "api_server": {**base["api_server"], "enabled": True}},
+            "jwt distinto": {**base, "api_server": {**base["api_server"], "jwt_secret_key": "x"}},
+            "api user": {**base, "api_server": {**base["api_server"], "username": "u"}},
+            "telegram on": {**base, "telegram": {"enabled": True, "token": "", "chat_id": ""}},
+            "telegram token": {**base, "telegram": {"enabled": False, "token": "t", "chat_id": ""}},
+            "pricing": {**base, "entry_pricing": {**base["entry_pricing"], "use_order_book": True}},
+            "internals": {**base, "internals": {"heartbeat_interval": 30}},
             "secret": {**base, "exchange": {**ex, "secret": "y"}},
         }
         for label, cfg in variants.items():
@@ -199,8 +192,7 @@ class LaunchCase(unittest.TestCase):
             argv = launch.build_command(code, store)
             self.assertIsInstance(argv, list)
             self.assertIn("NoTradeSmoke", argv)
-            cfgs = [a for a in argv if a.endswith(".json")]
-            self.assertEqual(len(cfgs), 1, argv)
+            self.assertEqual(len([a for a in argv if a.endswith(".json")]), 1, argv)
             self.assertTrue(any(code in a for a in argv), argv)
             self.assertTrue(any(store in a for a in argv), argv)
 
@@ -222,20 +214,22 @@ class LaunchCase(unittest.TestCase):
                 before = datetime.now(timezone.utc)
                 out = Path(launch.prepare_smoke(code, store, PINNED_IMAGE))
                 after = datetime.now(timezone.utc)
+                frozen = out.read_bytes()
+                again = Path(launch.prepare_smoke(code, store, PINNED_IMAGE))
+            self.assertNotEqual(out, again, "cada prepare devuelve ruta unica")
+            self.assertEqual(out.read_bytes(), frozen, "el segundo prepare no toca el primero")
             manifest = json.loads(out.read_text(encoding="utf-8"))
             self.assertEqual(manifest["config_hash"], launch.file_hash(cfg_path))
             self.assertEqual(manifest["strategy_hash"], launch.file_hash(strat_path))
             self.assertEqual(manifest["commit"], COMMIT)
             self.assertIn(PINNED_IMAGE, json.dumps(manifest))
-            expected = manifest["expected_command"]
-            joined = " ".join(expected)
-            self.assertIn("NoTradeSmoke", expected)
+            joined = " ".join(manifest["expected_command"])
+            self.assertIn("NoTradeSmoke", manifest["expected_command"])
             self.assertIn("/opt/btc-lab", joined)
             self.assertIn("/freqtrade/user_data", joined)
             self.assertNotIn(code, joined, "host debe normalizarse a contenedor")
             self.assertNotIn(store, joined, "host debe normalizarse a contenedor")
-            ts = manifest.get("created_at") or manifest.get("timestamp")
-            parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat((manifest.get("created_at") or manifest["timestamp"]).replace("Z", "+00:00"))
             self.assertLessEqual(before - timedelta(seconds=5), parsed)
             self.assertLessEqual(parsed, after + timedelta(seconds=5))
             self.assertTrue(manifest.get("run_id") or manifest.get("input_id"))
@@ -251,6 +245,8 @@ class LaunchCase(unittest.TestCase):
                 launch.prepare_smoke(code, store, PINNED_IMAGE)
             with _git_image(), self.assertRaises((ValueError, RuntimeError, SystemExit)):
                 launch.prepare_smoke(code, store, "")
+            with _git_image(), self.assertRaises((ValueError, RuntimeError, SystemExit)):
+                launch.prepare_smoke(code, store, "freqtradeorg/freqtrade:2026.8")
             with _git_image(), self.assertRaises((ValueError, RuntimeError, SystemExit, FileNotFoundError)):
                 launch.prepare_smoke(str(Path(code) / "nope"), store, PINNED_IMAGE)
             for doc in Path(store).rglob("*.json"):
@@ -267,53 +263,55 @@ class LaunchCase(unittest.TestCase):
                 manifest_in = launch.prepare_smoke(code, store, PINNED_IMAGE)
             proc = _fake_popen(3)
             with mock.patch.object(launch.subprocess, "Popen", return_value=proc) as popen:
-                rc = launch.run_smoke(code, store, manifest_in)
-            self.assertEqual(rc, 3)
+                self.assertEqual(launch.run_smoke(code, store, manifest_in), 3)
             _, kwargs = popen.call_args
             self.assertFalse(kwargs.get("shell", False))
-            leaked = [k for k in (kwargs.get("env", {}) or {}) if k.startswith("FREQTRADE__")]
-            self.assertEqual(leaked, [])
-            runs = sorted((Path(store) / "runs").rglob("*.json"))
-            payload = json.loads(runs[-1].read_text(encoding="utf-8"))
+            self.assertEqual([k for k in (kwargs.get("env", {}) or {}) if k.startswith("FREQTRADE__")], [])
+            payload = json.loads(_runs(store)[-1].read_text(encoding="utf-8"))
             self.assertEqual(payload["exit_code"], 3)
             self.assertEqual(str(payload["status"]).upper(), "FAILED")
             with mock.patch.object(launch.subprocess, "Popen", side_effect=OSError("boom")), \
                     self.assertRaises(Exception):
                 launch.run_smoke(code, store, manifest_in)
+            with mock.patch.object(launch, "_module_hash", return_value="0" * 64), \
+                    mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)) as popen3, \
+                    self.assertRaises(ValueError):
+                launch.run_smoke(code, store, manifest_in)
+            self.assertFalse(popen3.called, "launch/health alterados frenan antes del Popen")
             (Path(code) / "configs" / "smoke.json").write_bytes(b'{"tampered": true}')
-            proc_ok = _fake_popen(0)
-            with mock.patch.object(launch.subprocess, "Popen", return_value=proc_ok) as popen2, \
+            with mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)) as popen2, \
                     self.assertRaises((ValueError, RuntimeError, SystemExit)):
                 launch.run_smoke(code, store, manifest_in)
-            self.assertFalse(popen2.called, "hash cambiado frena antes del Popen")
+            self.assertFalse(popen2.called, "config alterada frena antes del Popen")
+            self.assertFalse([p for p in _runs(store)
+                              if str(json.loads(p.read_text(encoding="utf-8")).get("status", "")).upper() == "SUCCEEDED"])
 
-    def test_run_never_overwrites(self):
+    def test_run_never_overwrites_input_immutable(self):
         with tempfile.TemporaryDirectory() as code, tempfile.TemporaryDirectory() as store:
             _write_tree(code)
             with _git_image():
                 first = launch.prepare_smoke(code, store, PINNED_IMAGE)
+                frozen = Path(first).read_bytes()
                 with mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)):
                     launch.run_smoke(code, store, first)
+                self.assertEqual(Path(first).read_bytes(), frozen, "input inmutable")
                 second = launch.prepare_smoke(code, store, PINNED_IMAGE)
+                self.assertNotEqual(Path(second), Path(first), "segundo prepare con ruta unica")
+                self.assertEqual(Path(first).read_bytes(), frozen, "segundo prepare no toca el primero")
                 with mock.patch.object(launch.subprocess, "Popen", return_value=_fake_popen(0)):
                     launch.run_smoke(code, store, second)
-            runs = sorted((Path(store) / "runs").rglob("*.json"))
+            runs = _runs(store)
             self.assertGreaterEqual(len(runs), 2, runs)
             ids = [json.loads(p.read_text(encoding="utf-8")).get("run_id") or p.name for p in runs]
             self.assertEqual(len(set(ids)), len(ids))
 
 
 class HealthCase(unittest.TestCase):
-    def setUp(self):
-        if health is None:
-            self.fail(f"RED: operations.health no implementado ({_HEALTH_ERR!r})")
-
     def test_healthy(self):
         now = datetime(2026, 9, 21, 12, 0, 0, tzinfo=timezone.utc)
-        started = now - timedelta(seconds=300)
         res = health.evaluate_health(
-            _inspect(started), _heartbeat(now - timedelta(seconds=30)), 50 * 1024**3, now)
-        self.assertIsInstance(res, dict)
+            _inspect(now - timedelta(seconds=300)),
+            _heartbeat(now - timedelta(seconds=30)), 50 * 1024**3, now)
         self.assertEqual(res["status"], "healthy", res)
         self.assertIsInstance(res["reasons"], list)
 
@@ -321,20 +319,27 @@ class HealthCase(unittest.TestCase):
         now = datetime(2026, 9, 21, 12, 0, 0, tzinfo=timezone.utc)
         started = now - timedelta(seconds=300)
         fresh = _heartbeat(now - timedelta(seconds=30))
-        stale = _heartbeat(now - timedelta(seconds=600))
-        recent_other = _other_line(now - timedelta(seconds=30))
-        iso_line = f"{(now - timedelta(seconds=30)).isoformat()} engine heartbeat\n"
-        restarted = now - timedelta(seconds=60)
+        full = _inspect(started)["State"]
+        no_oom = {"State": {k: v for k, v in full.items() if k != "OOMKilled"}, "RestartCount": 0}
+        no_status = {"State": {k: v for k, v in full.items() if k != "Status"}, "RestartCount": 0}
+        no_restarts = {"State": dict(full)}
+        bad_started = {"State": {**full, "StartedAt": "nonsense"}, "RestartCount": 0}
         cases = {
             "detenido": (_inspect(started, running=False), fresh, 50 * 1024**3),
-            "stale": (_inspect(started), stale, 50 * 1024**3),
+            "stale": (_inspect(started), _heartbeat(now - timedelta(seconds=600)), 50 * 1024**3),
+            "futuro": (_inspect(started), _heartbeat(now + timedelta(seconds=60)), 50 * 1024**3),
             "no-heartbeat": (_inspect(started), "", 50 * 1024**3),
-            "reciente-no-heartbeat": (_inspect(started), recent_other, 50 * 1024**3),
-            "fecha-cualquiera-no-prueba": (_inspect(started), iso_line, 50 * 1024**3),
-            "heartbeat-previo-a-StartedAt": (_inspect(restarted), _heartbeat(now - timedelta(seconds=120)), 50 * 1024**3),
+            "reciente-no-heartbeat": (_inspect(started), _other_line(now - timedelta(seconds=30)), 50 * 1024**3),
+            "fecha-cualquiera-no-prueba": (_inspect(started), f"{(now - timedelta(seconds=30)).isoformat()} engine heartbeat\n", 50 * 1024**3),
+            "heartbeat-previo-a-StartedAt": (_inspect(now - timedelta(seconds=60)), _heartbeat(now - timedelta(seconds=120)), 50 * 1024**3),
             "oom": (_inspect(started, oom=True), fresh, 50 * 1024**3),
+            "oom-ausente": (no_oom, fresh, 50 * 1024**3),
+            "status-ausente": (no_status, fresh, 50 * 1024**3),
+            "started-ilegible": (bad_started, fresh, 50 * 1024**3),
             "restarts": (_inspect(started, restarts=2), fresh, 50 * 1024**3),
+            "restarts-ausente": (no_restarts, fresh, 50 * 1024**3),
             "disco-0": (_inspect(started), fresh, 0),
+            "espacio-nan": (_inspect(started), fresh, float("nan")),
             "espacio-None": (_inspect(started), fresh, None),
             "inspect-None": (None, fresh, 50 * 1024**3),
             "malformado": (_inspect(started), "basura sin formato", 50 * 1024**3),
