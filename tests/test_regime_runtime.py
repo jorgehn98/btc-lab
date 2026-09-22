@@ -1,6 +1,8 @@
 """Filesystem isolation and fail-closed native fills for the new TRAIN study."""
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -98,6 +100,70 @@ class RegimeLedgerCase(unittest.TestCase):
 
 
 class RegimeScreenCase(unittest.TestCase):
+    def test_native_batch_matches_individual_variants(self):
+        if os.environ.get("LAB_NATIVE_NETWORK_TEST") != "1":
+            self.skipTest("aceptacion nativa requiere contenedor de investigacion con Binance publico")
+        if pd is None:
+            self.skipTest("Freqtrade/pandas solo en imagen fijada")
+        try:
+            import freqtrade  # noqa: F401
+        except ImportError:
+            self.skipTest("Freqtrade solo en imagen fijada")
+        from operations import search
+        from research.regime import generate_variants, render_strategy_module
+        from research.evaluation import parse_native_batch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            seg = data_root / "seg00"
+            seg.mkdir(parents=True)
+            prices = ([100.0] * 200 + [90.0] * 50 + [150.0] * 20
+                      + [110.0, 151.0] + [140.0] * 80)
+            idx1 = pd.date_range("2020-01-01", periods=len(prices), freq="1h", tz="UTC")
+            idx5 = pd.date_range("2020-01-01", periods=len(prices) * 12,
+                                 freq="5min", tz="UTC")
+            for path, dates, closes in ((seg / PAIR1, idx1, prices),
+                                        (seg / PAIR5, idx5,
+                                         [p for p in prices for _ in range(12)])):
+                pd.DataFrame({"date": dates, "open": closes,
+                              "high": [p + 0.5 for p in closes],
+                              "low": [p - 0.5 for p in closes],
+                              "close": closes, "volume": 10.0}).to_feather(str(path))
+            generated = root / "generated"
+            generated.mkdir()
+            (generated / "RegimeCandidatesGenerated.py").write_text(
+                render_strategy_module(), encoding="utf-8")
+            names = [v["class_name"] for v in generate_variants() if v["id"]
+                     in ("R000", "R012")]
+            window = {"seg_dir": "seg00", "start": idx1[249].isoformat(),
+                      "end_exclusive": (idx1[-1] + pd.Timedelta(hours=1)).isoformat()}
+
+            def run(selected):
+                index = len(list(root.glob("native-*")))
+                user, out = root / f"user-{index}", root / f"native-{index}"
+                user.mkdir()
+                out.mkdir()
+                argv = search._native_argv_for_batch(
+                    window, 0.002, selected, generated, user, out,
+                    len(selected) > 1, snap_root=str(data_root))
+                proc = subprocess.run(argv, capture_output=True, text=True,
+                                      timeout=90, check=False)
+                self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+                zips = list(out.glob("*.zip"))
+                self.assertEqual(len(zips), 1)
+                parsed, error = parse_native_batch(zips[0], selected)
+                self.assertIsNone(error)
+                return parsed
+
+            batch = run(names)
+            self.assertGreater(sum(batch[n]["trades_count"] for n in names), 0)
+            for name in names:
+                single = run([name])[name]
+                self.assertAlmostEqual(batch[name]["profit_abs"], single["profit_abs"],
+                                       delta=1e-8)
+                self.assertEqual(batch[name]["trades"], single["trades"])
+
     def test_train_screen_uses_only_new_root_and_ends_no_candidate(self):
         if pd is None:
             self.skipTest("screen requiere pandas de imagen")
