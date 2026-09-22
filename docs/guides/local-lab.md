@@ -1,12 +1,12 @@
 # Guía del laboratorio local
 
-Esta guía opera el smoke de la [base BTC lab](../../README.md#objetivo). El baseline tiene una [guía separada](baseline.md) para no mezclar sus datos, DB, input y timer con el smoke. Ejecuta los comandos desde una shell de la raíz del proyecto, que es el árbol de trabajo Git, y conserva las rutas absolutas: el espacio de `Crypto Trading Bot` debe ir entre comillas.
+Esta guía opera el smoke de la [base BTC lab](../../README.md#objetivo). El histórico y el ledger tienen una [guía separada](history.md), y el baseline una [guía separada](baseline.md), para no mezclar datos, DB, inputs ni timers. El baseline permanece pausado mientras avanza la investigación. Ejecuta los comandos desde una shell de la raíz del proyecto, que es el árbol de trabajo Git, y conserva las rutas absolutas: el espacio de `Crypto Trading Bot` debe ir entre comillas.
 
 ## Límites de esta fase
 
-Esta guía cubre el proceso `NoTradeSmoke` sobre BTC/USDT spot en `dry_run`, con `5m`, sin credenciales, API ni Telegram. La estrategia devuelve siempre señales de entrada y salida a cero y bloquea cualquier entrada; no es rentable por diseño, no es un forward test y no produce evidencia económica. No se deben calcular métricas de retorno con sus cero trades. El baseline experimental activo se opera únicamente mediante [su guía separada](baseline.md).
+Esta guía cubre el proceso `NoTradeSmoke` sobre BTC/USDT spot en `dry_run`, con `5m`, sin credenciales, API ni Telegram. La estrategia devuelve siempre señales de entrada y salida a cero y bloquea cualquier entrada; no es rentable por diseño, no es un forward test y no produce evidencia económica. No se deben calcular métricas de retorno con sus cero trades. El baseline experimental, actualmente pausado, solo se opera mediante [su guía separada](baseline.md) y una decisión explícita.
 
-El objetivo del proyecto es reunir evidencia reproducible para rechazar estrategias después de costes y riesgo. El siguiente estudio usa solo `TRAIN` (2018–2022 en UTC); no adelanta `VALIDATION` ni el `TEST` sellado. No se publica ningún adjunto privado.
+El objetivo del proyecto es reunir evidencia reproducible para rechazar estrategias después de costes y riesgo. La campaña actual y sus particiones están en la [guía del histórico](history.md); esta guía no abre `VALIDATION` ni `TEST`. No se publica ningún adjunto privado.
 
 ## Variables y Docker
 
@@ -179,7 +179,7 @@ La restauración solo se verifica en `verify-tradesv3.dryrun.sqlite`, una ruta n
 
 ## Timer de usuario y límites de disponibilidad
 
-Las units versionadas son `operations/systemd/btc-lab-health.service` y `.timer`: una comprobación oneshot cada cinco minutos, `TimeoutStartSec=30`, journald y sin restart automático. El timer smoke debe permanecer desactivado mientras baseline sea el perfil activo; antes de reactivarlo, vuelve a enlazar las units desde `~/.config/systemd/user`. El grupo `docker` efectivo para systemd está verificado y `Linger=no`. No se debe habilitar linger, cambiar suspensión ni convertirlo en un servicio global. Sin linger, el timer solo funciona mientras la sesión de usuario y el PC estén disponibles.
+Las units versionadas son `operations/systemd/btc-lab-health.service` y `.timer`: una comprobación oneshot cada cinco minutos, `TimeoutStartSec=30`, journald y sin restart automático. El timer smoke debe permanecer desactivado mientras se mantenga pausado el baseline o exista otro perfil activo; antes de reactivarlo, vuelve a enlazar las units desde `~/.config/systemd/user`. El grupo `docker` efectivo para systemd está verificado y `Linger=no`. No se debe habilitar linger, cambiar suspensión ni convertirlo en un servicio global. Sin linger, el timer solo funciona mientras la sesión de usuario y el PC estén disponibles.
 
 Activa el timer solo como operación explícita y considera la activación confirmada únicamente después de revisar `status`, journal y el JSON de health:
 

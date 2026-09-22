@@ -135,3 +135,51 @@ services:
         bind:
           create_host_path: false
           selinux: z
+  history-data:
+    <<: *engine
+    profiles: [history]
+    entrypoint: [python, -m, operations.history]
+    command: [--help]
+    cpus: 4.0
+    mem_limit: 8g
+    restart: "no"
+    stop_grace_period: 30s
+    volumes:
+      - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/market:/opt/btc-lab/market:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/downloads:/lab-history/downloads:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/snapshots:/lab-history/snapshots:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/control:/lab-history/control:rw,z
+      - type: bind
+        source: ${LAB_HISTORY_INPUT:-/nonexistent/btc-lab-history-unprepared.json}
+        target: /lab-history/input.json
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+  history:
+    <<: *engine
+    profiles: [history]
+    entrypoint: [python, -m, operations.history]
+    command: [--help]
+    cpus: 4.0
+    mem_limit: 8g
+    restart: "no"
+    stop_grace_period: 30s
+    volumes:
+      - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/market:/opt/btc-lab/market:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/snapshots:/lab-history/snapshots:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/sessions:/lab-history/sessions:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/control:/lab-history/control:rw,z
+      - type: bind
+        source: ${LAB_HISTORY_INPUT:-/nonexistent/btc-lab-history-unprepared.json}
+        target: /lab-history/input.json
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
