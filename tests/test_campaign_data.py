@@ -1,6 +1,6 @@
 """T01 — particiones por rol y ledger mark-to-market (RED).
 
-Seams propuestos (implementer en PR01):
+Seams (implementer PR01, misma raiz/rama, sin worktrees):
 - market/history.py: partition_bounds(role) -> (start, end) UTC semiabierto.
   Roles exactos: "train", "validation", "test". Sin fechas configurables
   ni flags de bypass.
@@ -15,13 +15,21 @@ Seams propuestos (implementer en PR01):
   median_excess_by_year(...). Benchmark comparable y metricas
   ponderadas por tiempo/ano, no por episodios.
 
-Literales independientes (no copiar el 1039.58 inconsistente del encargo):
+Literales independientes (no copiar el 1039.58 inconsistente):
 amount 2 entry 100 fee .001 -> cash 799.8; precio 80 -> equity 959.8
 DD 40.2 USDT / 0.0402; salida 110 fee .001 -> final 1019.58, fees 0.42.
 La perdida abierta debe verse aunque el cierre sea beneficio.
 
-Run host (sin pandas): stdlib corre, pandas salta.
-Run runtime fijado: imagen con pandas/numpy, sin red.
+Bugs del primer GREEN (coordinador, DD15%): pct debe ser max pct
+(1000->840 =16% manda sobre 2000->1800 =10% abs 200); cierre EXACTO
+en end liquida caja final y curva terminal sin vela futura; fills
+fuera de grid 5m y cobertura incompleta rechazan; is_short True/1
+rechaza aunque falte side; solape max1 rechaza pero close+open mismo
+ts acepta en cualquier orden y open==close misma vela es valido;
+mediana exige mismos anos, sin interseccion silenciosa.
+
+Run host (sin pandas): stdlib corre (particiones + metricas puras),
+pandas salta. Run runtime fijado: imagen con pandas/numpy, sin red.
 """
 
 import math
@@ -258,6 +266,39 @@ class LedgerCase(unittest.TestCase):
         self.assertLess(pct, 1.0, "pct no es importe")
         self.assertNotAlmostEqual(usdt, pct, delta=1.0, msg="unidades no intercambiables")
 
+    def test_drawdown_pct_is_max_pct_not_abs_over_abs_peak(self):
+        """1000->840 (16%) manda sobre 2000->1800 (200 abs pero 10%)."""
+        build_ledger = self._ledger()
+        start = datetime(2021, 6, 1, 0, 0, tzinfo=UTC)
+        end = datetime(2021, 6, 1, 0, 20, tzinfo=UTC)
+        # Fees 0 para aislar la curva exacta: 800+2*precio.
+        # 100->1000, 20->840, 600->2000, 500->1800 (fees+terminal en otro test).
+        prices = _make_prices("2021-06-01 00:00", [100.0, 20.0, 600.0, 500.0])
+        trade = _trade(start, end, close_rate=500.0, fee_open=0.0, fee_close=0.0)
+        _, summary = build_ledger(prices, [trade], 1000.0, start, end)
+        self.assertAlmostEqual(summary["max_drawdown_usdt"], 200.0, delta=1e-6)
+        self.assertAlmostEqual(summary["max_drawdown_pct"], 0.16, delta=1e-9)
+        self.assertAlmostEqual(summary["peak"], 2000.0, delta=1e-6)
+
+    def test_close_at_end_terminal_cash_in_curve(self):
+        """Cierre EXACTO en end: caja 959.64 y DD 40.36 en curva terminal."""
+        build_ledger = self._ledger()
+        prices = _make_prices("2021-06-01 00:00", [100.0] * 12)
+        trade = _trade(self.WINDOW_START, self.WINDOW_END,
+                       close_rate=80.0)
+        curve, summary = build_ledger(prices, [trade], 1000.0,
+                                      self.WINDOW_START, self.WINDOW_END)
+        # 799.8 + (2*80 - 0.16) = 959.64; DD 40.36 / 4.036%.
+        self.assertAlmostEqual(summary["final_cash"], 959.64, delta=0.01)
+        self.assertAlmostEqual(summary["final_equity"], 959.64, delta=0.01)
+        self.assertAlmostEqual(summary["max_drawdown_usdt"], 40.36, delta=0.05)
+        self.assertAlmostEqual(summary["max_drawdown_pct"], 0.04036, delta=0.0005)
+        dates = list(curve["date"])
+        self.assertEqual(dates[-1], self.WINDOW_END, "fila EVENTO terminal en end")
+        self.assertAlmostEqual(float(curve["equity"].iloc[-1]), 959.64, delta=0.01)
+        self.assertAlmostEqual(float(curve["quantity"].iloc[-1]), 0.0, delta=1e-9)
+        self.assertTrue(all(d <= self.WINDOW_END for d in dates), "nada futuro")
+
     def test_reconciles_final_within_001_and_zero_qty(self):
         build_ledger = self._ledger()
         prices, trades = self._fixture()
@@ -283,39 +324,98 @@ class LedgerCase(unittest.TestCase):
             ("hueco sin invento", gapped, trades),
             ("trade fuera de ventana", prices, [out_trade]),
             ("precio NaN", nan_prices, trades),
-            ("corto", prices, [_trade(open_dt, close_dt, side="short")]),
+            ("corto side", prices, [_trade(open_dt, close_dt, side="short")]),
+            ("is_short True sin side", prices, [dict(
+                {k: v for k, v in _trade(open_dt, close_dt).items() if k != "side"},
+                is_short=True)]),
+            ("is_short 1", prices, [_trade(open_dt, close_dt, is_short=1)]),
             ("apalancado", prices, [_trade(open_dt, close_dt, leverage=2.0)]),
             ("amount no finito", prices, [_trade(open_dt, close_dt, amount=float("inf"))]),
             ("fee negativa", prices, [_trade(open_dt, close_dt, fee_open=-0.01)]),
+            ("fill 00:01 fuera de grid", prices, [_trade(
+                datetime(2021, 6, 1, 0, 1, tzinfo=UTC),
+                datetime(2021, 6, 1, 0, 6, tzinfo=UTC))]),
+            ("cobertura falta inicio", _make_prices("2021-06-01 00:05", [100.0] * 11), trades),
+            ("cobertura falta fin", _make_prices("2021-06-01 00:00", [100.0] * 11), trades),
+            ("solape max1", prices, [
+                _trade(open_dt, datetime(2021, 6, 1, 0, 20, tzinfo=UTC)),
+                _trade(datetime(2021, 6, 1, 0, 5, tzinfo=UTC),
+                       datetime(2021, 6, 1, 0, 15, tzinfo=UTC))]),
         ]
         for label, px, tr in cases:
             with self.subTest(label=label):
                 with self.assertRaises(ValueError, msg=label):
                     build_ledger(px, tr, 1000.0, self.WINDOW_START, self.WINDOW_END)
 
-    def test_sampling_strictly_within_end_and_ordered(self):
+    def test_close_open_same_ts_accepted_any_order_and_intrabar(self):
+        """Close+open mismo ts acepta en ambos ordenes; open==close valido."""
+        build_ledger = self._ledger()
+        prices = _make_prices("2021-06-01 00:00", [100.0] * 12)
+        t_a = _trade(datetime(2021, 6, 1, 0, 0, tzinfo=UTC),
+                     datetime(2021, 6, 1, 0, 10, tzinfo=UTC),
+                     amount=1.0, open_rate=100.0, close_rate=100.0)
+        t_b = _trade(datetime(2021, 6, 1, 0, 10, tzinfo=UTC),
+                     datetime(2021, 6, 1, 0, 20, tzinfo=UTC),
+                     amount=1.0, open_rate=100.0, close_rate=100.0)
+        curves = []
+        for label, ordered in (("A,B", [t_a, t_b]), ("B,A", [t_b, t_a])):
+            with self.subTest(orden=label):
+                # Caja justa (150) para que open-antes-que-close falle por
+                # margen: solo close-primero es valido en ambos ordenes.
+                curve, summary = build_ledger(prices, ordered, 150.0,
+                                              self.WINDOW_START, self.WINDOW_END)
+                # 2 trades 1x(100->100): 150-100.1+99.9-100.1+99.9 = 149.6.
+                self.assertAlmostEqual(summary["final_cash"], 149.6, delta=0.02)
+                self.assertLessEqual(float(curve["quantity"].max()), 1.0 + 1e-9,
+                                     "max1: close antes que open")
+                curves.append(curve["equity"].tolist())
+        if len(curves) == 2:
+            self.assertEqual(curves[0], curves[1], "independiente del orden de lista")
+        # Misma vela open==close (stop intrabar nativo): valido.
+        t_same = _trade(datetime(2021, 6, 1, 0, 10, tzinfo=UTC),
+                        datetime(2021, 6, 1, 0, 10, tzinfo=UTC),
+                        amount=1.0, open_rate=100.0, close_rate=90.0)
+        _, summary = build_ledger(prices, [t_same], 1000.0,
+                                  self.WINDOW_START, self.WINDOW_END)
+        # Coste 100.1, proceeds 89.91 -> final 989.81.
+        self.assertAlmostEqual(summary["final_cash"], 989.81, delta=0.02)
+
+    def test_sampling_prices_within_end_ordered(self):
         build_ledger = self._ledger()
         prices, trades = self._fixture()
         curve, _ = build_ledger(prices, trades, 1000.0,
                                 self.WINDOW_START, self.WINDOW_END)
         dates = list(curve["date"])
-        self.assertTrue(all(d < self.WINDOW_END for d in dates), "end exclusivo")
+        # Filas de precio en [begin, end); solo un EVENTO terminal puede ser ==end.
+        self.assertTrue(all(d <= self.WINDOW_END for d in dates), "nada futuro")
         self.assertTrue(all(d >= self.WINDOW_START for d in dates))
-        self.assertEqual(dates, sorted(dates), "orden temporal")
+        price_dates = [d for d in dates if d < self.WINDOW_END]
+        self.assertEqual(price_dates, sorted(price_dates), "orden temporal")
         self.assertEqual(len(set(dates)), len(dates), "sin duplicados")
-        # Fills simultaneos: mismo timestamp, orden de lista determinista.
-        t2 = _trade(datetime(2021, 6, 1, 0, 0, tzinfo=UTC),
-                    datetime(2021, 6, 1, 0, 55, tzinfo=UTC),
-                    amount=1.0, open_rate=100.0, close_rate=100.0)
-        _, summary = build_ledger(prices, trades + [t2], 1000.0,
-                                  self.WINDOW_START, self.WINDOW_END)
-        # Segundo trade 1x(100->100) pierde 0.2 fees: 1019.58-0.2=1019.38.
-        self.assertAlmostEqual(summary["final_cash"], 1019.38, delta=0.02)
+        self.assertEqual(len(price_dates), len(prices), "cobertura completa")
+
+    def test_prices_datetime_units_ns_vs_us_equal(self):
+        """Dataset nativo ns vs us: mismo resultado (regresion pandas3 .asi8)."""
+        build_ledger = self._ledger()
+        import pandas as pd
+
+        prices, trades = self._fixture()
+        ns = prices.copy()
+        ns["date"] = pd.to_datetime(ns["date"], utc=True).astype("datetime64[ns, UTC]")
+        us = prices.copy()
+        us["date"] = pd.to_datetime(us["date"], utc=True).astype("datetime64[us, UTC]")
+        curve_ns, summary_ns = build_ledger(ns, trades, 1000.0,
+                                            self.WINDOW_START, self.WINDOW_END)
+        curve_us, summary_us = build_ledger(us, trades, 1000.0,
+                                            self.WINDOW_START, self.WINDOW_END)
+        self.assertEqual(curve_ns["equity"].tolist(), curve_us["equity"].tolist())
+        self.assertAlmostEqual(summary_ns["final_cash"], summary_us["final_cash"], delta=1e-9)
+        self.assertAlmostEqual(summary_ns["max_drawdown_usdt"],
+                               summary_us["max_drawdown_usdt"], delta=1e-9)
 
 
 class BenchmarkCase(unittest.TestCase):
     def test_comparable_uses_same_profile_from_9900(self):
-        _require_pandas(self)
         from market.equity import buyhold_comparable
 
         # Bajo 2%: min(990, 12.375/0.026) = 475.9615... literal.
@@ -330,7 +430,6 @@ class BenchmarkCase(unittest.TestCase):
         self.assertAlmostEqual(medio["quantity"], 951.9230769 / 100.0, delta=1e-9)
 
     def test_comparable_uses_effective_opens_and_marks_exposure(self):
-        _require_pandas(self)
         from market.equity import buyhold_comparable
 
         got = buyhold_comparable(100.0, 110.0, 9900.0, 0.0025, 0.20, 0.02, 0.001)
@@ -342,7 +441,6 @@ class BenchmarkCase(unittest.TestCase):
 
 class TimeWeightedCase(unittest.TestCase):
     def test_g_weighted_by_days_not_episodes(self):
-        _require_pandas(self)
         from market.equity import time_weighted_g
 
         episodes = [
@@ -356,7 +454,6 @@ class TimeWeightedCase(unittest.TestCase):
         self.assertGreater(abs(got - 0.00718280), 0.002, "pondera por dias")
 
     def test_median_excess_per_year_not_per_episode(self):
-        _require_pandas(self)
         from market.equity import median_excess_by_year
 
         cand = {2019: 0.01, 2020: 0.02, 2021: 0.03}
@@ -365,6 +462,13 @@ class TimeWeightedCase(unittest.TestCase):
         got = median_excess_by_year(cand, bench)
         self.assertAlmostEqual(got, 0.005, delta=1e-9)
         self.assertLess(got, (0.005 + 0.005 + 0.01) / 3, "mediana, no media")
+
+    def test_median_rejects_mismatched_years(self):
+        from market.equity import median_excess_by_year
+
+        with self.assertRaises(ValueError, msg="anos distintos no se intersectan"):
+            median_excess_by_year({2019: 0.01, 2020: 0.02},
+                                  {2019: 0.005, 2020: 0.015, 2021: 0.02})
 
 
 if __name__ == "__main__":
