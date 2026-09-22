@@ -6,6 +6,7 @@ Laboratorio propio de BTC/USDT spot con Freqtrade en Docker. La entrega contiene
 un smoke `dry_run` (`NoTradeSmoke`) y un baseline experimental cerrado
 (`SmaCrossBaseline`). El baseline no es una estrategia económica validada ni
 trading real; cualquier activación depende de sus gates y de una decisión explícita.
+La campaña de 72 variantes spot terminó TRAIN sin finalistas; no activó ningún bot.
 El repositorio no es un fork de Freqtrade; consume su imagen oficial sin modificarla.
 
 ## Stack y estructura
@@ -25,10 +26,13 @@ El repositorio no es un fork de Freqtrade; consume su imagen oficial sin modific
 - `operations/history.py` y `market/history.py`: histórico por roles y contrato
   fail-closed de TRAIN/VALIDATION/TEST.
 - `market/equity.py`: ledger analítico MTM de fills nativos y reconciliación.
+- `operations/search.py` y `research/`: campaña cerrada, selección y presupuesto.
+- `strategies/search/`: variantes spot y control experimental.
 - `tests/test_operations.py`: contratos de seguridad, identidad, señales y salud.
 - `docs/guides/local-lab.md`: guía única de operación y recuperación.
 - `docs/guides/baseline.md`: guía operativa de investigación y baseline.
 - `docs/guides/history.md`: guía única del histórico, snapshots y ledger.
+- `docs/guides/strategy-search.md`: protocolo y dictamen de la búsqueda cerrada.
 - `storage/`: datos persistentes locales, fuera de Git.
 - `work/` y `.engram/`: planificación y memoria locales, fuera de Git.
 
@@ -84,7 +88,7 @@ No añadir tests de texto que solo copien el contenido de Compose o de la docume
 - Solo Binance público, BTC/USDT spot, `dry_run: true`, sin claves de exchange.
   API y Telegram desactivados y sin puertos publicados. El JWT de configuración
   es un placeholder público requerido por el schema, no una credencial utilizable.
-- No habilitar live, short, futuros, leverage, otras estrategias ni overrides
+- No habilitar live, short, futuros, leverage, estrategias fuera de los perfiles cerrados ni overrides
   `FREQTRADE__*`. No cambiar la imagen fijada silenciosamente por `stable/latest`.
 - `prepare-smoke` y `prepare-baseline` corren en el host: exigen árbol Git limpio,
   imagen disponible y hashes de los módulos del perfil. Devuelven un archivo único;
@@ -92,9 +96,9 @@ No añadir tests de texto que solo copien el contenido de Compose o de la docume
 - `operations.history prepare` corre en el host y solo prepara TRAIN en PR01:
   Binance público BTC/USDT spot `5m`, `[2017-08-17T04:00Z, 2023-01-01T00:00Z)`.
   `download`, `snapshot` y `ledger` corren en contenedores y no montan Git.
-- VALIDATION y TEST permanecen fail-closed hasta que PR02 implemente y verifique
-  sus artefactos de fase. Los helpers de autorización pura no desbloquean el
-  runtime. No descargar ni evaluar roles externos durante PR01.
+- VALIDATION y TEST exigen grants canónicos derivados de finalistas verificados;
+  no existen en esta campaña porque SCREEN terminó sin TOP9. Los helpers de
+  autorización pura no desbloquean el runtime. No descargar ni evaluar esos roles.
 - `LAB_HISTORY_INPUT` debe fijar el manifiesto único devuelto por `prepare`; no se
   permite elegir el input más reciente ni usar flags libres para abrir TEST.
 - `LAB_SMOKE_INPUT` fija ese archivo antes del primer `up`. Dentro del contenedor
@@ -109,7 +113,8 @@ No añadir tests de texto que solo copien el contenido de Compose o de la docume
   como activo ni se activa por la existencia de resultados históricos.
 - Reanudar un input congelado no autoriza a modificar los archivos que identifica.
   Una versión nueva requiere nuevo preflight; nunca ajustar hashes para ocultar cambios.
-- Docker monta solo `operations/`, `configs/`, `strategies/` y `market/` como código RO.
+- Docker monta solo `operations/`, `configs/`, `strategies/`, `market/` y
+  `research/` como código RO.
   Research monta además únicamente los directorios de datos que necesita; nunca la
   raíz con Git/memoria/storage completo ni el socket Docker en el contenedor.
 - Conservar UID/GID 1000:1000, rootfs RO, capabilities eliminadas,

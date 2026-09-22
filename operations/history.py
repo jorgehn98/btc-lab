@@ -109,6 +109,35 @@ def phase_artifact_contract() -> dict:
     }
 
 
+def verify_holdout_grant(role, grant, definition_hash, expected_ids,
+                         report_sha256) -> dict:
+    """Puente PR02: autoriza holdout solo con grant de operations.search.
+
+    No abre VAL/TEST por CLI manual: el llamante debe ser operations.search
+    tras verificar state canonico + report seleccionado por SHA + definition
+    hash + candidatos esperados. Delega la forma a
+    market.history.verify_phase_grant y exige el hash del report correcto.
+    Sin campo `force`; metadata con hash refs inmutable. El prepare publico
+    con rol externo sin este grant sigue fallando (PR01 intacto).
+    """
+    if role not in ("validation", "test"):
+        raise ValueError(f"holdout solo validation/test, no {role!r}")
+    if not isinstance(grant, dict):
+        raise ValueError("grant debe ser dict")
+    if "force" in grant:
+        raise ValueError("campo 'force' prohibido en grant")
+    from market.history import verify_phase_grant as _verify_form
+
+    checked = _verify_form(role, grant, definition_hash, expected_ids)
+    # El report que autoriza el holdout debe coincidir con el verificado.
+    key = "train_report_sha256" if role == "validation" else "validation_report_sha256"
+    if str(grant.get(key) or "") != str(report_sha256 or ""):
+        raise ValueError(f"grant sin {key} verificado por hash")
+    if not report_sha256 or not isinstance(report_sha256, str):
+        raise ValueError("report_sha256 inmutable requerido")
+    return checked
+
+
 def _code_hashes(code_root: Path) -> dict:
     code = Path(code_root)
     return {
@@ -147,13 +176,82 @@ def _check_input_manifest(manifest: dict) -> None:
         raise ValueError("input sin commit valido")
     if not manifest.get("input_id"):
         raise ValueError("input sin input_id")
-    if manifest.get("role") != "train":
-        raise ValueError("input PR01 solo rol train")
-    start, end = _role_bounds(str(manifest.get("role")))
+    if "force" in manifest:
+        raise ValueError("campo 'force' prohibido en input")
+    role = str(manifest.get("role") or "")
+    if role == "train":
+        start, end = _role_bounds("train")
+        if manifest.get("range_start") != start.isoformat():
+            raise ValueError("input etiqueta range_start distinto a constantes del rol")
+        if manifest.get("range_end") != end.isoformat():
+            raise ValueError("input etiqueta range_end distinto a constantes del rol")
+        return
+    # Roles externos (PR02): solo con grant verificable; sin flags manuales.
+    # El prepare publico con rol externo sigue fallando (ver prepare_history):
+    # estos inputs solo los acuña prepare_history_with_grant tras verificar
+    # el estado canonico + report de seleccion + definition hash.
+    if role not in ("validation", "test"):
+        raise ValueError(f"input con rol inesperado: {role!r}")
+    grant = manifest.get("grant")
+    if not isinstance(grant, dict):
+        raise ValueError(f"input {role} sin grant verificable")
+    expected_ids = manifest.get("expected_ids")
+    if not isinstance(expected_ids, list) or not expected_ids:
+        raise ValueError(f"input {role} sin expected_ids")
+    report_sha = manifest.get("report_sha256")
+    if not isinstance(report_sha, str) or not report_sha:
+        raise ValueError(f"input {role} sin report_sha256")
+    definition_hash = manifest.get("definition_hash")
+    if not isinstance(definition_hash, str) or not definition_hash:
+        raise ValueError(f"input {role} sin definition_hash")
+    verify_holdout_grant(role, grant, definition_hash, expected_ids, report_sha)
+    if list(str(v) for v in expected_ids) != _grant_ids(role, grant):
+        raise ValueError(f"input {role}: expected_ids difiere del grant")
+    start, end = _role_bounds(role)
     if manifest.get("range_start") != start.isoformat():
         raise ValueError("input etiqueta range_start distinto a constantes del rol")
     if manifest.get("range_end") != end.isoformat():
         raise ValueError("input etiqueta range_end distinto a constantes del rol")
+
+
+def _grant_ids(role: str, grant: dict) -> list:
+    if role == "validation":
+        return [str(v) for v in (grant.get("validation_ids") or [])]
+    return [str(grant.get("candidate_id"))]
+
+
+def _require_authorized_role(manifest_in: dict) -> str:
+    """Rol del input con autorizacion verificada (train directo, resto grant).
+
+    Los roles externos exigen ADEMAS la autoridad canonica RO: el grant del
+    input debe estar registrado en el estado canonico
+    (/lab-search-authority). Sin ese montaje, bloquean; TRAIN funciona sin el.
+    """
+    role = str(manifest_in.get("role") or "train")
+    if role == "train":
+        _require_train_only(role)
+        return role
+    if role not in ("validation", "test"):
+        raise ValueError(f"rol inesperado: {role!r}")
+    grant = manifest_in.get("grant")
+    if not isinstance(grant, dict):
+        raise ValueError(f"{role}: sin grant verificable (ver phase-contract)")
+    verify_holdout_grant(
+        role, grant,
+        str(manifest_in.get("definition_hash") or ""),
+        list(manifest_in.get("expected_ids") or []),
+        str(manifest_in.get("report_sha256") or ""),
+    )
+    try:
+        from operations.search import authorize_holdout, load_authority
+    except ImportError as exc:
+        raise ValueError(f"{role}: autoridad no disponible: {exc}") from exc
+    try:
+        authority = load_authority()
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        raise ValueError(f"{role}: autoridad RO ausente o ilegible: {exc}") from exc
+    authorize_holdout(authority, role, grant)
+    return role
 
 
 def _load_input() -> dict:
@@ -212,7 +310,7 @@ def _locked():
 
 
 def prepare_history(code_root, storage_root, image_ref, role: str = "train") -> str:
-    """Preflight HOST (solo train en PR01); devuelve manifiesto unico."""
+    """Preflight HOST para TRAIN publico; devuelve un manifiesto unico."""
     if role != "train":
         raise ValueError(f"prepare PR01 solo train, no {role!r} (ver phase-contract)")
     if not isinstance(image_ref, str) or image_ref.strip() != launch.PINNED_IMAGE:
@@ -263,9 +361,102 @@ def prepare_history(code_root, storage_root, image_ref, role: str = "train") -> 
     return str(out)
 
 
+def prepare_history_with_grant(code_root, storage_root, image_ref, role: str,
+                               grant: dict, expected_ids, report_sha256: str,
+                               definition_hash: str) -> str:
+    """Preflight HOST para roles externos con grant verificado (PR02).
+
+    Solo la invoca operations.search prepare-phase tras verificar estado
+    canonico + report de seleccion por SHA + definition hash + candidatos
+    esperados. El prepare publico con rol externo sin grant sigue fallando.
+    No acepta flags force/IDs manuales: todo viene del grant verificado.
+    """
+    if role not in ("validation", "test"):
+        raise ValueError(f"grant solo para validation/test, no {role!r}")
+    if not isinstance(grant, dict) or "force" in grant:
+        raise ValueError("grant invalido o con campo prohibido")
+    if not isinstance(expected_ids, (list, tuple)) or not expected_ids:
+        raise ValueError("expected_ids debe ser lista no vacia")
+    if not isinstance(report_sha256, str) or not report_sha256:
+        raise ValueError("report_sha256 inmutable requerido")
+    if not isinstance(definition_hash, str) or not definition_hash:
+        raise ValueError("definition_hash requerido")
+    if not isinstance(image_ref, str) or image_ref.strip() != launch.PINNED_IMAGE:
+        raise ValueError("image_ref debe ser exactamente la imagen fijada con digest")
+    verify_holdout_grant(role, grant, definition_hash,
+                         list(expected_ids), report_sha256)
+    if list(str(v) for v in expected_ids) != _grant_ids(role, grant):
+        raise ValueError(f"{role}: expected_ids difiere del grant verificado")
+    code = Path(code_root)
+    store = Path(storage_root)
+    if not code.is_dir():
+        raise FileNotFoundError(f"codigo no encontrado: {code}")
+    # Autoridad canonica del store (no el dict que trae el llamante): el
+    # grant debe estar registrado en store/search/control. Sin flags JSON
+    # externos que valgan como autoridad.
+    authority_path = store / "search" / "control"
+    authority_files = sorted(authority_path.glob("campaign-*.json"))
+    if len(authority_files) != 1:
+        raise ValueError("estado canonico unico ausente en search/control")
+    try:
+        authority = json.loads(authority_files[0].read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"estado canonico ilegible: {exc}") from exc
+    try:
+        from operations.search import authorize_holdout
+    except ImportError as exc:
+        raise ValueError(f"autoridad no disponible: {exc}") from exc
+    authorize_holdout(authority, role, grant)
+    try:
+        config = json.loads((code / CONFIG_REL).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"config baseline ilegible: {exc}") from exc
+    launch.validate_baseline_config(config, os.environ)
+    for rel in (HISTORY_REL, RESEARCH_REL, EQUITY_REL, PARTITIONS_REL,
+                TRAIN_HELPER_REL, CONFIG_REL,
+                Path("operations/launch.py"), Path("operations/health.py")):
+        if not (code / rel).is_file():
+            raise FileNotFoundError(f"fichero hasheado ausente: {rel}")
+    start, end = _role_bounds(role)
+    commit = launch._git_commit(code)
+    launch._git_clean(code)
+    image_id = launch._inspect_image(image_ref.strip())
+    hashes = _code_hashes(code)
+    manifest = {
+        "kind": INPUT_KIND,
+        "status": "PREPARED",
+        "input_id": uuid.uuid4().hex,
+        "created_at": _utcnow_iso(),
+        "commit": commit,
+        "image_ref": image_ref.strip(),
+        "image_id": image_id,
+        "image_digest": launch.PINNED_IMAGE,
+        "role": role,
+        "grant": dict(grant),
+        "expected_ids": [str(v) for v in expected_ids],
+        "report_sha256": str(report_sha256),
+        "definition_hash": str(definition_hash),
+        "pair": PAIR,
+        "exchange": EXCHANGE,
+        "timeframe": TIMEFRAME_1H,
+        "timeframe_detail": TIMEFRAME_5M,
+        "timerange": _timerange_exact(role),
+        "range_start": start.isoformat(),
+        "range_end": end.isoformat(),
+        "warmup_bars_1h": WARMUP_BARS,
+        **hashes,
+    }
+    out = store / "history" / "inputs" / f"history-input-{role}-{_slug()}.json"
+    launch._atomic_create_new(out, manifest)
+    return str(out)
+
+
 def history_download_argv(config_path: str, datadir: str, role: str = "train") -> list:
-    """Argv cerrado de descarga spot por rol (PR01: solo train)."""
-    _require_train_only(role)
+    """Argv cerrado de descarga spot por rol (rango fijo por rol, sin flags)."""
+    if role not in ("train", "validation", "test"):
+        raise ValueError(f"rol desconocido: {role!r}")
     return [
         "freqtrade", "download-data",
         "--config", str(config_path),
@@ -287,7 +478,7 @@ def cmd_download() -> int:
         print(f"download: input/codigo no valido: {exc}", file=sys.stderr)
         return 2
     try:
-        _require_train_only(str(manifest_in.get("role") or "train"))
+        role = _require_authorized_role(manifest_in)
     except ValueError as exc:
         print(f"download: {exc}", file=sys.stderr)
         return 2
@@ -295,15 +486,15 @@ def cmd_download() -> int:
     try:
         with _locked():
             dl_id = uuid.uuid4().hex
-            root = history / "downloads" / f"train-dl-{_slug()}-{dl_id[:4]}"
+            root = history / "downloads" / f"{role}-dl-{_slug()}-{dl_id[:4]}"
             data_dir = root / "data"
             user_dir = root / "user_data"
             data_dir.mkdir(parents=True, exist_ok=False)
             user_dir.mkdir(parents=True, exist_ok=False)
-            manifest_path = history / "downloads" / f"train-dl-{_slug()}-{dl_id[:4]}.json"
-            argv = history_download_argv(CONTAINER_CONFIG, str(data_dir), "train")
+            manifest_path = history / "downloads" / f"{role}-dl-{_slug()}-{dl_id[:4]}.json"
+            argv = history_download_argv(CONTAINER_CONFIG, str(data_dir), role)
             argv = argv + ["--userdir", str(user_dir)]
-            start, end = _role_bounds("train")
+            start, end = _role_bounds(role)
             base = {
                 "kind": DOWNLOAD_KIND,
                 "status": "RUNNING",
@@ -313,10 +504,10 @@ def cmd_download() -> int:
                 "commit": manifest_in.get("commit"),
                 "image_ref": manifest_in.get("image_ref"),
                 "image_id": manifest_in.get("image_id"),
-                "role": "train",
+                "role": role,
                 "pair": PAIR,
                 "timeframe": TIMEFRAME_5M,
-                "timerange": _timerange_exact("train"),
+                "timerange": _timerange_exact(role),
                 "range_start": start.isoformat(),
                 "range_end": end.isoformat(),
                 "datadir": str(data_dir),
@@ -408,10 +599,15 @@ def cmd_snapshot(download_ref: str) -> int:
     if dl_manifest.get("kind") != DOWNLOAD_KIND or dl_manifest.get("status") != "SUCCEEDED":
         print("snapshot: download no esta SUCCEEDED", file=sys.stderr)
         return 1
-    if dl_manifest.get("role") != "train" or dl_manifest.get("pair") != PAIR:
+    try:
+        role = _require_authorized_role(manifest_in)
+    except ValueError as exc:
+        print(f"snapshot: {exc}", file=sys.stderr)
+        return 2
+    if dl_manifest.get("role") != role or dl_manifest.get("pair") != PAIR:
         print("snapshot: download de otro rol/par", file=sys.stderr)
         return 1
-    if dl_manifest.get("timerange") != _timerange_exact("train"):
+    if dl_manifest.get("timerange") != _timerange_exact(role):
         print("snapshot: download de otro rango", file=sys.stderr)
         return 1
     try:
@@ -435,9 +631,9 @@ def cmd_snapshot(download_ref: str) -> int:
     try:
         with _locked():
             snap_id = uuid.uuid4().hex
-            manifest_path = snapshots / f"train-snap-{_slug()}-{snap_id[:4]}.json"
-            snap_dir = snapshots / f"train-snap-{snap_id[:8]}"
-            start, end = _role_bounds("train")
+            manifest_path = snapshots / f"{role}-snap-{_slug()}-{snap_id[:4]}.json"
+            snap_dir = snapshots / f"{role}-snap-{snap_id[:8]}"
+            start, end = _role_bounds(role)
             base = {
                 "kind": SNAPSHOT_KIND,
                 "status": "RUNNING",
@@ -448,9 +644,9 @@ def cmd_snapshot(download_ref: str) -> int:
                 "download_manifest": str(dl_manifest_path),
                 "commit": manifest_in.get("commit"),
                 "image_ref": manifest_in.get("image_ref"),
-                "role": "train",
+                "role": role,
                 "pair": PAIR,
-                "timerange": _timerange_exact("train"),
+                "timerange": _timerange_exact(role),
                 "range_start": start.isoformat(),
                 "range_end": end.isoformat(),
                 "warmup_bars_1h": WARMUP_BARS,
@@ -533,7 +729,7 @@ def cmd_snapshot(download_ref: str) -> int:
         return 1
 
 
-def _load_eval_snapshot(snapshot_ref: str) -> tuple:
+def _load_eval_snapshot(snapshot_ref: str, expected_role: str = "train") -> tuple:
     base_name = _safe_basename(snapshot_ref)
     history = Path(CONTAINER_HISTORY)
     snaps = history / "snapshots"
@@ -548,8 +744,8 @@ def _load_eval_snapshot(snapshot_ref: str) -> tuple:
         raise ValueError("snapshot kind inesperado")
     if manifest.get("status") != "FROZEN":
         raise ValueError("snapshot no esta FROZEN")
-    if manifest.get("role") != "train":
-        raise ValueError("snapshot de otro rol")
+    if manifest.get("role") != expected_role:
+        raise ValueError(f"snapshot de rol {manifest.get('role')!r}, se exige {expected_role!r}")
     snap_dir = _contained(snaps, str(manifest.get("snapshot_dir") or ""), "snapshot_dir")
     if not snap_dir.is_dir():
         raise ValueError("snapshot_dir ausente (evaluacion RO, sin reparar)")
@@ -613,11 +809,12 @@ def cmd_ledger(snapshot_ref: str, segment: int, trades_ref: str,
     try:
         manifest_in = _load_input()
         _verify_current_against_input(manifest_in)
+        role = _require_authorized_role(manifest_in)
     except Exception as exc:
         print(f"ledger: input/codigo no valido: {exc}", file=sys.stderr)
         return 2
     try:
-        snap_manifest, snap_dir, snap_path = _load_eval_snapshot(snapshot_ref)
+        snap_manifest, snap_dir, snap_path = _load_eval_snapshot(snapshot_ref, role)
     except FileNotFoundError:
         print(f"ledger: snapshot inexistente: {snapshot_ref}", file=sys.stderr)
         return 2

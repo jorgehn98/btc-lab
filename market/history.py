@@ -8,9 +8,9 @@ Intervalos semiabiertos UTC (PRD aprobado):
 
 No hay fechas configurables ni flags de bypass. La autorizacion pura valida
 forma (conteos, duplicados, extras) pero NO sustituye la autorizacion
-persistente de runtime: VAL/TEST exigen artefacto de fase verificable
-(protocolo PR02). En PR01 el runner solo abre TRAIN; roles externos quedan
-fail-closed hasta que ese protocolo exista.
+persistente de runtime: VAL/TEST exigen un artefacto de fase verificable.
+El runner publico de TRAIN sigue separado del flujo PR02 con grants para roles
+externos.
 """
 
 from __future__ import annotations
@@ -111,3 +111,79 @@ def authorize_partition(role, selection):
         "candidate": candidate,
         "consumed": False,
     }
+
+
+def verify_phase_grant(role, grant, definition_hash, expected_ids) -> dict:
+    """Puente PR02: verifica grant inmutable de holdout (forma, no autoridad).
+
+    La autoridad real vive en operations.search (state + reports verificados
+    + definition hash + candidatos esperados) y en operations.history
+    (verify_holdout_grant). Este helper puro solo valida forma cerrada para
+    que un JSON manual no abra holdout: sin campo `force`, con grant_id,
+    campaign_id, definition_hash y candidatos con formato V000..V071.
+    No cambia authorize_partition (PR01 intacto).
+    """
+    if role not in ("validation", "test"):
+        raise ValueError(f"grant solo para validation/test, no {role!r}")
+    if not isinstance(grant, dict):
+        raise ValueError("grant debe ser dict")
+    if "force" in grant:
+        raise ValueError("campo 'force' prohibido en grant")
+    for key in ("campaign_id", "grant_id", "definition_hash"):
+        value = grant.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"grant sin {key} valido")
+    if str(grant.get("definition_hash")) != str(definition_hash):
+        raise ValueError("grant con definition_hash distinto (inmutable)")
+    if role == "validation":
+        allowed = {"campaign_id", "grant_id", "definition_hash", "phase",
+                   "validation_ids", "train_report_sha256"}
+        extra = set(grant) - allowed
+        if extra:
+            raise ValueError(f"validation grant con claves no permitidas: {sorted(extra)}")
+        if grant.get("phase") != "validation":
+            raise ValueError("grant phase debe ser validation")
+        ids = grant.get("validation_ids")
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 3:
+            raise ValueError("validation grant exige 1..3 validation_ids")
+        for vid in ids:
+            if not isinstance(vid, str) or len(vid) != 4 or not vid.startswith("V"):
+                raise ValueError(f"validation_id con formato invalido: {vid!r}")
+            try:
+                num = int(vid[1:])
+            except ValueError:
+                raise ValueError(f"validation_id invalida: {vid!r}") from None
+            if not 0 <= num <= 71:
+                raise ValueError(f"validation_id fuera de V000..V071: {vid!r}")
+        if set(str(v) for v in ids) != set(str(v) for v in (expected_ids or [])):
+            raise ValueError("validation grant fuera de candidatos esperados")
+        report = grant.get("train_report_sha256")
+        if not isinstance(report, str) or not report:
+            raise ValueError("grant sin train_report_sha256")
+        return {"role": role, "validation_ids": list(ids),
+                "grant_id": str(grant.get("grant_id")),
+                "definition_hash": str(definition_hash)}
+    allowed = {"campaign_id", "grant_id", "definition_hash", "phase",
+               "candidate_id", "validation_report_sha256"}
+    extra = set(grant) - allowed
+    if extra:
+        raise ValueError(f"test grant con claves no permitidas: {sorted(extra)}")
+    if grant.get("phase") != "test":
+        raise ValueError("grant phase debe ser test")
+    vid = grant.get("candidate_id")
+    if not isinstance(vid, str) or len(vid) != 4 or not vid.startswith("V"):
+        raise ValueError(f"candidate_id con formato invalido: {vid!r}")
+    try:
+        num = int(str(vid)[1:])
+    except ValueError:
+        raise ValueError(f"candidate_id invalida: {vid!r}") from None
+    if not 0 <= num <= 71:
+        raise ValueError(f"candidate_id fuera de V000..V071: {vid!r}")
+    if list(expected_ids or []) != [str(vid)]:
+        raise ValueError("test grant fuera de candidata esperada")
+    report = grant.get("validation_report_sha256")
+    if not isinstance(report, str) or not report:
+        raise ValueError("grant sin validation_report_sha256")
+    return {"role": role, "candidate_id": str(vid),
+            "grant_id": str(grant.get("grant_id")),
+            "definition_hash": str(definition_hash)}
