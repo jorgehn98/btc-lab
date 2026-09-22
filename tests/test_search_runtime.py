@@ -536,6 +536,12 @@ class HoldoutGateCase(unittest.TestCase):
                                               file_1h_sha256=launch.file_hash(evil / "seg00" / PAIR1))]
                 with self.assertRaises(ValueError, msg="archivos fuera de raiz rechazan"):
                     S._verify_snapshot_data_files(snaps, trav)
+            with self.subTest(check="alias fijo del mount"):
+                alias = Path(tmp) / "train"
+                alias.symlink_to(snaps / str(manifest["snapshot_dir"]),
+                                 target_is_directory=True)
+                checked = S._verify_snapshot_data_files(alias, manifest)
+                self.assertEqual(checked["segments"], 1)
 
 
 class ParseAggregateCase(unittest.TestCase):

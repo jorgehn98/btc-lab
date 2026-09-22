@@ -339,19 +339,21 @@ def _pair_feather(pair: str, timeframe: str) -> str:
     return f"{cleaned}-{timeframe}.feather"
 
 
-def _verify_snapshot_data_files(snaps_base: Path, manifest: dict) -> dict:
+def _verify_snapshot_data_files(snapshot_root: Path, manifest: dict) -> dict:
     """Coteja hashes de archivos de datos (no solo campos del manifiesto).
 
-    Toda ruta del manifiesto se encarcela con _within_root/_contained
-    (symlinks resueltos): '../evil' o absolutos fuera de la raiz rechazan
-    ANTES de leer ningun byte.
+    `snapshot_root` es el directorio real ya resuelto por el host o el mount
+    fijo del rol en container. `snapshot_dir` sigue validandose como nombre
+    simple, pero no se usa para reconstruir el alias del mount.
     """
     from operations.research import _contained, _within_root
 
     snap_raw = str(manifest.get("snapshot_dir") or "")
-    if not snap_raw or snap_raw in (".", ".."):
+    if (not snap_raw or snap_raw in (".", "..")
+            or Path(snap_raw).name != snap_raw
+            or "/" in snap_raw or "\\" in snap_raw):
         raise ValueError("snapshot_dir ilegible")
-    snap_dir = _within_root(Path(snaps_base), Path(snap_raw), "snapshot_dir")
+    snap_dir = Path(snapshot_root).resolve()
     if not snap_dir.is_dir():
         raise ValueError("snapshot_dir ausente (RO, sin reparar)")
     checked = {"segments": 0, "files": []}
@@ -766,7 +768,7 @@ def _verify_current_against_input(manifest_in: dict) -> dict:
     if launch.file_hash(snap_manifest_path) != manifest_in.get("definition", {}).get(
             "snapshot_train_ref", {}).get("manifest_sha256"):
         raise ValueError("snapshot TRAIN manifiesto alterado")
-    _verify_snapshot_data_files(Path(CONTAINER_SNAP_TRAIN).parent, snapshot_manifest)
+    _verify_snapshot_data_files(Path(CONTAINER_SNAP_TRAIN), snapshot_manifest)
     snapshot_ref = {
         "manifest": str(manifest_in["definition"]["snapshot_train_ref"]["manifest"]),
         "manifest_sha256": launch.file_hash(snap_manifest_path),
@@ -1462,7 +1464,7 @@ def _verify_role_snapshot_host(store: Path, role: str, basename: str) -> dict:
     manifest_path = snaps / _safe_manifest_basename(basename)
     manifest = _load_snapshot_manifest_file(manifest_path)
     _verify_snapshot_scope(manifest, role)
-    _verify_snapshot_data_files(snaps, manifest)
+    _verify_snapshot_data_files(snaps / str(manifest.get("snapshot_dir") or ""), manifest)
     from market.history import partition_bounds
 
     start, end = partition_bounds(role)
@@ -3182,7 +3184,7 @@ def _load_role_snapshot(role: str, binding: dict) -> tuple[dict, Path]:
                 "whole_1h_sha256", "range_start", "range_end"):
         if str(manifest.get(key)) != str(binding.get(key)):
             raise ValueError(f"snapshot {role} diverge del binding ({key})")
-    _verify_snapshot_data_files(Path(snap_root).parent, manifest)
+    _verify_snapshot_data_files(Path(snap_root), manifest)
     return manifest, Path(snap_root)
 
 
