@@ -1,6 +1,6 @@
 # Guía del laboratorio local
 
-Esta guía opera el smoke de la [base BTC lab](../../README.md#objetivo). Ejecuta los comandos desde una shell de la raíz del proyecto, que es el árbol de trabajo Git, y conserva las rutas absolutas: el espacio de `Crypto Trading Bot` debe ir entre comillas.
+Esta guía opera el smoke de la [base BTC lab](../../README.md#objetivo). El baseline tiene una [guía separada](baseline.md) para no mezclar sus datos, DB, input y timer con el smoke. Ejecuta los comandos desde una shell de la raíz del proyecto, que es el árbol de trabajo Git, y conserva las rutas absolutas: el espacio de `Crypto Trading Bot` debe ir entre comillas.
 
 ## Límites de esta fase
 
