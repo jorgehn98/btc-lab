@@ -46,7 +46,7 @@ def _fee_match(value, target) -> bool:
         return False
 
 
-def _validate_record(rec) -> None:
+def _validate_record(rec, known_ids=None) -> None:
     if not isinstance(rec, dict):
         raise ValueError("registro debe ser dict")
     for field in RECORD_FIELDS:
@@ -55,7 +55,7 @@ def _validate_record(rec) -> None:
     vid = rec.get("variant_id")
     if not isinstance(vid, str) or not vid:
         raise ValueError(f"variant_id ilegible: {vid!r}")
-    if str(vid) not in _KNOWN_IDS:
+    if str(vid) not in (_KNOWN_IDS if known_ids is None else known_ids):
         raise ValueError(f"variant_id desconocida: {vid!r}")
     role = rec.get("role")
     if role not in ("train", "validation", "test"):
@@ -101,13 +101,13 @@ def _validate_record(rec) -> None:
         raise ValueError(f"turnover debe ser finito >=0: {turnover!r}")
 
 
-def _validate_all(records) -> list:
+def _validate_all(records, known_ids=None) -> list:
     if not isinstance(records, (list, tuple)):
         raise ValueError("records debe ser lista")
     out = list(records)
     seen = set()
     for rec in out:
-        _validate_record(rec)
+        _validate_record(rec, known_ids)
         key = (
             str(rec.get("variant_id")),
             str(rec.get("role")),
