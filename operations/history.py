@@ -673,6 +673,8 @@ def cmd_ledger(snapshot_ref: str, segment: int, trades_ref: str,
     except (TypeError, ValueError):
         print("ledger: initial no numerico", file=sys.stderr)
         return 2
+    attempt_path: Path | None = None
+    attempt_base: dict | None = None
     try:
         with _locked():
             from datetime import datetime as _dt
@@ -690,6 +692,8 @@ def cmd_ledger(snapshot_ref: str, segment: int, trades_ref: str,
                 "trades_ref": str(tpath),
             }
             launch._atomic_create_new(manifest_path, {**base, "status": "RUNNING"})
+            attempt_path = manifest_path
+            attempt_base = base
 
             def _fail(reason) -> int:
                 launch._atomic_replace(manifest_path, {**base, "status": "FAILED",
@@ -719,8 +723,13 @@ def cmd_ledger(snapshot_ref: str, segment: int, trades_ref: str,
                 prices = pd.read_feather(str(seg_5_path))
             except (OSError, ValueError) as exc:
                 return _fail(exc)
-            eval_start = _dt.fromisoformat(str(meta["eval_start"]).replace("Z", "+00:00"))
-            window_end = _dt.fromisoformat(str(meta["end_exclusive"]).replace("Z", "+00:00"))
+            try:
+                eval_start = _dt.fromisoformat(str(meta["eval_start"]).replace("Z", "+00:00"))
+                window_end = _dt.fromisoformat(str(meta["end_exclusive"]).replace("Z", "+00:00"))
+            except (KeyError, ValueError, TypeError) as exc:
+                return _fail(f"meta fechas eval invalidas: {exc}")
+            if eval_start.tzinfo is None or window_end.tzinfo is None:
+                return _fail("meta fechas eval sin zona UTC")
             # Ventana efectiva: recorta warmup del 5m; trades enteros para que
             # un open en warmup falle en el ledger en vez de ignorarse.
             try:
@@ -760,11 +769,28 @@ def cmd_ledger(snapshot_ref: str, segment: int, trades_ref: str,
                                                     "result": entry})
             print(str(manifest_path))
             return 0 if status == "SUCCEEDED" else 1
-    except ValueError as exc:
+    except Exception as exc:
+        # KeyboardInterrupt/SystemExit (BaseException) nunca se convierten:
+        # se propagan sin marcar exito ni FAILED inventado.
+        if attempt_path is None or attempt_base is None:
+            # Preflight/header/hash denegados: sin intento, como establece TDD.
+            if isinstance(exc, ValueError):
+                print(f"ledger: FAILED {exc}", file=sys.stderr)
+                return 1
+            if isinstance(exc, RuntimeError):
+                print(f"ledger: {exc}", file=sys.stderr)
+                return 1
+            raise
+        try:
+            launch._atomic_replace(attempt_path, {**attempt_base, "status": "FAILED",
+                                                   "finished_at": _utcnow_iso(),
+                                                   "error": f"{type(exc).__name__}: {exc}"})
+        except OSError as persist_exc:
+            print(f"ledger: FAILED {exc} (persist FAILED fallo: {persist_exc})",
+                  file=sys.stderr)
+            raise
         print(f"ledger: FAILED {exc}", file=sys.stderr)
-        return 1
-    except RuntimeError as exc:
-        print(f"ledger: {exc}", file=sys.stderr)
+        print(str(attempt_path))
         return 1
 
 

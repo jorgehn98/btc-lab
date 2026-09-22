@@ -619,5 +619,63 @@ class HistoryLedgerCase(unittest.TestCase):
             self.assertEqual(len(list((res / "sessions").glob("ledger-*.json"))), 2)
 
 
+    _MISSING = object()
+
+    def _set_eval_start(self, res, value):
+        path = res / "snapshots" / "train-snap-eval.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if value is self._MISSING:
+            manifest["segments_meta"][0].pop("eval_start", None)
+        else:
+            manifest["segments_meta"][0]["eval_start"] = value
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_cmd_ledger_corrupt_meta_dates_persist_failed(self):
+        """Meta corrupta con hashes OK: fechas fuera del inner_fail deben FAILED."""
+        _require_pandas(self)
+        from operations import history as H
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res, input_path, meta = self._tree(tmp)
+            ok_trade = self._eval_trade(meta)
+            self._write_trades(res, "trades-ok.json",
+                               {"trades": [ok_trade], "profit_total_abs": -0.2})
+            p1, p2, p3 = self._patched(H, res, input_path)
+            for label, value in (
+                ("eval_start ausente", self._MISSING),
+                ("eval_start ilegible", "no-es-fecha"),
+                ("eval_start ingenua sin UTC", "2021-06-09T09:00:00"),
+            ):
+                with self.subTest(label=label):
+                    self._set_eval_start(res, value)
+                    before = len(list((res / "sessions").glob("ledger-*.json")))
+                    with p1, p2, p3:
+                        try:
+                            rc = H.cmd_ledger("train-snap-eval.json", 0, "trades-ok.json",
+                                              10000.0, -0.2)
+                        except (KeyError, TypeError, ValueError) as exc:
+                            self.fail(f"RED: {label} escapo sin rc ni FAILED: {exc!r}")
+                    self.assertNotEqual(rc, 0, label)
+                    manifests = sorted((res / "sessions").glob("ledger-*.json"))
+                    self.assertEqual(len(manifests), before + 1,
+                                     f"{label}: un FAILED nuevo: {manifests}")
+                    self.assertEqual(
+                        json.loads(manifests[-1].read_text(encoding="utf-8"))["status"],
+                        "FAILED", label)
+            # Hash alterado: el loader rechaza antes de crear intento.
+            seg5 = (res / "snapshots" / "train-snap-eval" / "seg00"
+                    / H._pair_file(H.PAIR, H.TIMEFRAME_5M))
+            with open(seg5, "r+b") as handle:
+                handle.seek(0)
+                handle.write(b"\x00")
+            before = len(list((res / "sessions").glob("ledger-*.json")))
+            with p1, p2, p3:
+                rc_hash = H.cmd_ledger("train-snap-eval.json", 0, "trades-ok.json",
+                                       10000.0, -0.2)
+            self.assertNotEqual(rc_hash, 0, "hash alterado no es exito")
+            self.assertEqual(len(list((res / "sessions").glob("ledger-*.json"))), before,
+                             "hash denegado no crea intento")
+
+
 if __name__ == "__main__":
     unittest.main()
