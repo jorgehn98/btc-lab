@@ -1,0 +1,64 @@
+name: btc-lab
+x-engine: &engine
+  image: freqtradeorg/freqtrade:2026.8@sha256:4d23160b501d2b34579e76f57ad75edfa274967cd0dd824ff1c1b86d8c166ab4
+  user: "1000:1000"
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 128
+  working_dir: /opt/btc-lab
+  entrypoint: [python, -m, operations.launch]
+  environment:
+    TZ: UTC
+    PYTHONDONTWRITEBYTECODE: "1"
+    LAB_STORAGE: /lab-storage
+    NUMEXPR_NUM_THREADS: "1"
+    NUMEXPR_MAX_THREADS: "1"
+    OPENBLAS_NUM_THREADS: "1"
+    OMP_NUM_THREADS: "1"
+    MKL_NUM_THREADS: "1"
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=256m
+  volumes:
+    - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+    - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+    - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+    - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs:/lab-storage/runs:rw,z
+    - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs/inputs:/lab-storage/runs/inputs:ro,z
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+services:
+  engine:
+    <<: *engine
+    profiles: [tools]
+    command: [version]
+    network_mode: none
+    cpus: 1.0
+    mem_limit: 2g
+    restart: "no"
+  smoke:
+    <<: *engine
+    profiles: [smoke]
+    command: [smoke]
+    cpus: 1.0
+    mem_limit: 2g
+    restart: "on-failure:3"
+    stop_grace_period: 30s
+    volumes:
+      - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs:/lab-storage/runs:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs/inputs:/lab-storage/runs/inputs:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/runtime/smoke:/freqtrade/user_data:rw,z
+      - type: bind
+        source: ${LAB_SMOKE_INPUT:-/nonexistent/btc-lab-unprepared.json}
+        target: /lab-storage/active-input.json
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
