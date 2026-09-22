@@ -1,45 +1,10 @@
-"""Research baseline TRAIN: runner cerrado prepare/host + download/snapshot/backtest/bias.
+"""Runner cerrado de investigación TRAIN para el baseline.
 
-TRAIN BTC/USDT spot 5m semiabierto UTC [2018-01-01, 2023-01-01), timerange
-``20180101-20230101``. Derivacion 1h solo de grupos completos 12x5m alineadas,
-sin rellenar. Un run por segmento contiguo elegible con warmup 51 dentro del
-propio segmento y fricciones fijas. Sin backtester propio.
-
-Verificado en imagen fijada (``--help`` real):
-- ``download-data`` escribe con ``--datadir`` explicito directamente
-  ``<datadir>/BTC_USDT-5m.feather`` (``pair_to_filename`` + ``timeframe_to_file``,
-  sin sufijo ``-spot`` y sin subdir de exchange; ``create_datadir`` solo anade
-  el exchange cuando ``--datadir`` no se da). El snapshot exige ese nombre exacto.
-- ``backtesting`` acepta ``--timeframe/--timeframe-detail/--timerange/--fee/
-  --export/--export-directory/--cache``; el ZIP guarda ``backtest-result-*.json``
-  con ``strategy[SmaCrossBaseline]`` (profit_total_abs/profit_total/total_trades,
-  drawdown, trades con enter_tag/exit_reason).
-- ``lookahead-analysis`` acepta ``--minimum-trade-amount/--targeted-trade-amount/
-  --lookahead-analysis-exportfilename`` y su CSV tiene exactamente
-  ``filename,strategy,has_bias,total_signals,biased_entry_signals,
-  biased_exit_signals,biased_indicators`` (bool + conteos, no substring de logs).
-- ``recursive-analysis`` acepta ``--startup-candle`` y reporta por tabla/logs;
-  sin CSV maquina: se usa exit code + gate propio como evidencia.
-- ``IDataHandler._pair_data_filename`` + ``misc.pair_to_filename`` confirman el
-  nombre; ``ohlcv_load`` con ``fill_missing=True`` rellenaria huecos, por eso cada
-  segmento evaluado lleva solo su propio recorte (sin huecos que cruzar).
-
-Diseno cerrado:
-- ``prepare`` corre en HOST (Git limpio + ``docker image inspect`` + config
-  baseline cerrada + hashes). Devuelve ``storage/research/inputs/*.json`` unico.
-  Compose monta el elegido en ``/lab-research/input.json`` RO (``create_host_path:
-  false``). Los comandos de runtime leen ese unico input al arrancar y revalidan
-  hashes/metadata; nunca consultan Git dentro del contenedor (sin ``.git``).
-- Roots constantes del contenedor, sin flags libres de rutas/fechas. ``--help``
-  no necesita input; cualquier comando real lo exige.
-- Un job a la vez con ``fcntl`` sobre ``/lab-research/control/research.lock``
-  (volumen compartido entre ``research-data`` y ``research``).
-- Logs por streaming a fichero (sin ``capture_output`` ilimitado); para evidencia
-  solo se lee la cola acotada.
-- Snapshot independiente del runner posterior: el manifiesto fija hashes de datos
-  inmutables + hash de transformacion informativo; la evaluacion verifica los
-  datos por hash y registra codigo+input actuales sin exigir snapshot nuevo cuando
-  solo se arreglo el runner.
+Descarga datos BTC/USDT spot de 5m para el intervalo TRAIN fijado, deriva velas
+1h solo de grupos completos y ejecuta las herramientas nativas de backtest y
+sesgo por segmento contiguo elegible. La preparación congela la identidad del
+código y la imagen; los comandos usan raíces fijas, un lock compartido, logs
+acotados y un snapshot de solo lectura verificado por hash antes de evaluar.
 """
 
 from __future__ import annotations
@@ -119,11 +84,10 @@ def _slug() -> str:
 
 
 def _pair_file(pair: str, timeframe: str) -> str:
-    """Nombre exacto Freqtrade para spot con --datadir explicito.
+    """Nombre exacto de Freqtrade para spot con ``--datadir`` explícito.
 
-    Verificado: ``pair_to_filename`` (``/`` -> ``_``) + ``timeframe_to_file``,
-    sin sufijo de vela para SPOT y sin subdir de exchange cuando ``--datadir``
-    es explicito. Para TRAIN: ``BTC_USDT-5m.feather`` / ``BTC_USDT-1h.feather``.
+    La imagen de runtime usa ``BTC_USDT-5m.feather`` y ``BTC_USDT-1h.feather``
+    para TRAIN; el snapshot exige esos nombres exactos.
     """
     cleaned = pair
     for ch in ("/", " ", ".", "@", "$", "+", ":"):
@@ -138,11 +102,10 @@ def _timerange_fmt(start_dt, end_exclusive_dt) -> str:
 
 
 def _load_5m_frame(feather_paths: list):
-    """Concatena feathers 5m sin normalizar: los duplicados los rechaza el validador.
+    """Concatena archivos 5m sin normalizarlos.
 
-    Sin ``drop_duplicates``/``sort`` previos: un timestamp duplicado (mismo archivo
-    o entre archivos, aunque sea contradictorio) sobrevive hasta
-    ``market.train.validate_ohlcv``, que lo rechaza con ``ValueError``.
+    Los duplicados quedan deliberadamente para que ``validate_ohlcv`` los
+    rechace, tanto dentro de un archivo como entre archivos y aunque sean contradictorios.
     """
     import pandas as pd
 
@@ -170,7 +133,11 @@ def _baseline_cap(wallet: float = 10000.0) -> float:
 
 def buyhold_for_segment(first_open: float, last_close: float,
                         wallet: float = 10000.0, fee: float = 0.001) -> dict:
-    """Buy-and-hold comparable: una exposicion cap, costes ambos lados."""
+    """Benchmark buy-and-hold aproximado con exposición limitada y fees fijas.
+
+    Este cálculo de fees es un proxy comparativo, no sustituye el modelo de
+    ejecución detallado de 5m del motor.
+    """
     import math
 
     cap = _baseline_cap(wallet)
@@ -222,7 +189,7 @@ def _load_input() -> dict:
 
 
 def _verify_current_against_input(manifest_in: dict) -> dict:
-    """El codigo montado RO debe coincidir con el input; sin Git aqui."""
+    """Exige que el código montado en solo lectura coincida con el input; sin Git aquí."""
     code = Path(CONTAINER_CODE)
     config_path = code / CONFIG_REL
     try:
@@ -654,6 +621,7 @@ def cmd_snapshot(download_ref: str) -> int:
 
 
 def _load_eval_snapshot(snapshot_ref: str) -> tuple:
+    """Carga y verifica por hash un snapshot congelado; evaluar nunca lo repara."""
     base_name = _safe_basename(snapshot_ref)
     research = Path(CONTAINER_RESEARCH)
     snaps = research / "snapshots"
@@ -671,7 +639,7 @@ def _load_eval_snapshot(snapshot_ref: str) -> tuple:
     snap_dir = _contained(snaps, str(manifest.get("snapshot_dir") or ""), "snapshot_dir")
     if not snap_dir.is_dir():
         raise ValueError("snapshot_dir ausente (evaluacion RO, sin reparar)")
-    # Verificar inmutabilidad de datos por hash (toda la foto + cada segmento).
+    # Verifica por hash el snapshot completo y cada segmento antes de leer datos.
     for label, rel, key in (
         ("5m total", _pair_file(TRAIN_PAIR, TRAIN_TIMEFRAME_5M), "whole_5m_sha256"),
         ("1h total", _pair_file(TRAIN_PAIR, TRAIN_TIMEFRAME_1H), "whole_1h_sha256"),
@@ -723,7 +691,7 @@ def _num_or_none(value):
 
 
 def _summarize_native(native_dir: Path) -> tuple:
-    """Parsea el ZIP nativo a metricas significativas; ausente/schema => error."""
+    """Parsea métricas nativas; archivos o schema requeridos ausentes son errores."""
     import zipfile
 
     zips = sorted([p for p in Path(native_dir).glob("*.zip") if p.is_file()])
@@ -784,7 +752,7 @@ def _summarize_native(native_dir: Path) -> tuple:
         drawdown = _num_or_none(strat.get("max_drawdown_account"))
     fees = _num_or_none(strat.get("total_fees"))
     if fees is None:
-        # Suma de fees de trades si el informe las trae; si no, nulo explicito.
+        # Usa fees por trade si faltan las fees agregadas.
         try:
             fee_sum = 0.0
             seen = False
@@ -1061,12 +1029,10 @@ def _ref_trades(native_dir: Path) -> tuple:
 
 
 def _own_sma_gate(seg_1h_path: Path) -> dict:
-    """Compara la estrategia real consigo misma en recortes 51/100/200/400.
+    """Compara la estrategia real en prefijos de 51/100/200/400 velas.
 
-    Sin formula manual duplicada: referencia y recortes usan
-    ``SmaCrossBaseline.populate_*``. Para cada evento (enter/exit) con 400 velas
-    previas, cada recorte (ultimas N velas hasta el evento) debe dar mismos SMA
-    actual/anterior (tolerancia ``1e-10*max(1,|ref|)``) y mismas senales booleanas.
+    La referencia y los prefijos usan ``SmaCrossBaseline.populate_*``. En cada
+    evento con 400 velas de contexto deben coincidir SMA y señales booleanas.
     """
     import pandas as pd
 
@@ -1194,7 +1160,7 @@ def cmd_bias(snapshot_ref: str) -> int:
                                                        "finished_at": _utcnow_iso(), **verdict})
                 return 1
             if int(target.get("length", 0)) < MIN_RECURSIVE_BARS:
-                # Gate recursive exige >=1000; sin cobertura no se puede concluir.
+                # El análisis recursive exige 1.000 velas; menos es inconcluyente.
                 verdict = {"verdict": "INCONCLUSIVE",
                            "reason": f"cobertura insuficiente (<{MIN_RECURSIVE_BARS} velas)"}
                 launch._atomic_create_new(gate_path, {**base, **verdict,
@@ -1209,7 +1175,7 @@ def cmd_bias(snapshot_ref: str) -> int:
                 str(target["end_exclusive"]).replace("Z", "+00:00"))
             timerange = _timerange_fmt(eval_dt, end_dt)
             seg_dir = snap_dir / str(target.get("seg_dir"))
-            # 1) Referencia backtest en el mas largo con fee base.
+            # 1) Backtest de referencia en el segmento más largo con fee base.
             ref_dir = session_dir / "ref"
             ref_native = ref_dir / "native"
             ref_user = ref_dir / "user_data"
@@ -1250,7 +1216,7 @@ def cmd_bias(snapshot_ref: str) -> int:
                                                        "finished_at": _utcnow_iso(), **verdict})
                 return 1
             targeted = int(ref_info["count"]) + 1
-            # 2) Lookahead nativo sobre el mismo rango efectivo.
+            # 2) Análisis lookahead nativo sobre el mismo rango efectivo.
             look_dir = session_dir / "lookahead"
             look_dir.mkdir(parents=True, exist_ok=False)
             look_user = look_dir / "user_data"
@@ -1272,7 +1238,7 @@ def cmd_bias(snapshot_ref: str) -> int:
             ]
             look_log = look_dir / "lookahead.log"
             look_rc, look_timeout = _run_streaming(look_argv, BIAS_TIMEOUT_S, look_log)
-            # 3) Recursive nativo + gate propio con la estrategia real.
+            # 3) Análisis recursive nativo más el gate independiente de estrategia.
             rec_dir = session_dir / "recursive"
             rec_dir.mkdir(parents=True, exist_ok=False)
             rec_user = rec_dir / "user_data"
@@ -1294,7 +1260,7 @@ def cmd_bias(snapshot_ref: str) -> int:
             look_parsed, look_error = (None, None)
             if not look_timeout and look_rc == 0:
                 look_parsed, look_error = _parse_lookahead_csv(look_csv)
-            # Decision cerrada con evidencia (sin substring 'bias' en logs).
+            # Decide con evidencia estructurada, no por un substring del log.
             if look_timeout or rec_timeout:
                 verdict = {"verdict": "INCONCLUSIVE", "reason": "timeout en analisis nativo"}
             elif look_rc != 0:
@@ -1321,7 +1287,7 @@ def cmd_bias(snapshot_ref: str) -> int:
                 verdict = {"verdict": "INCONCLUSIVE", "reason": "timeout en recursive"}
             elif rec_rc != 0:
                 tail = _read_tail(rec_log, 8192).lower()
-                # 'chown'/warnings cosmeticos no son fallo: solo cobertura/error real.
+                # Warnings cosméticos no deciden el gate; sí cobertura/errores.
                 if ("insufficient" in tail or "too few" in tail or "no data" in tail):
                     verdict = {"verdict": "INCONCLUSIVE",
                                "reason": "recursive no concluyo por cobertura"}
