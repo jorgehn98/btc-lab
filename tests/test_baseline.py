@@ -33,7 +33,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -798,6 +798,46 @@ class ResearchSnapshotCase(unittest.TestCase):
                 with self.assertRaises(ValueError, msg="snapshot_dir fuera de la raiz"):
                     research._load_eval_snapshot("snap-abc123.json")
 
+    def test_snapshot_rechaza_feather_modificado_tras_download(self):
+        # cmd_snapshot importa pandas al arrancar: runtime autoritativo.
+        _require_market(self)
+        from operations import research
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res = Path(tmp) / "res"
+            dl = res / "downloads"
+            dl.mkdir(parents=True)
+            frame = _make_5m_frame(24, "2021-06-01")
+            feather = dl / research._pair_file("BTC/USDT", "5m")
+            frame.to_feather(str(feather))
+            old_hash = launch.file_hash(feather)
+            tampered = frame.copy()
+            tampered.loc[0, ["open", "high", "low", "close"]] = [101.0, 101.5, 100.5, 101.0]
+            tampered.to_feather(str(feather))
+            self.assertNotEqual(launch.file_hash(feather), old_hash, "fixture muta el fichero")
+            (dl / "dl-abc.json").write_text(json.dumps({
+                "kind": research.DOWNLOAD_KIND, "status": "SUCCEEDED",
+                "download_id": "d1", "pair": "BTC/USDT",
+                "timerange": research.TRAIN_TIMERANGE,
+                "datadir": str(dl), "data_file_sha256": old_hash,
+            }), encoding="utf-8")
+            hashes = research._code_hashes(ROOT)
+            research_input = {
+                "kind": research.INPUT_KIND, "status": "PREPARED",
+                "image_ref": launch.PINNED_IMAGE, "commit": BASELINE_COMMIT,
+                "input_id": "in1", **hashes,
+            }
+            input_path = Path(tmp) / "input.json"
+            input_path.write_text(json.dumps(research_input), encoding="utf-8")
+            with mock.patch.object(research, "CONTAINER_RESEARCH", str(res)), \
+                    mock.patch.object(research, "CONTAINER_INPUT", str(input_path)), \
+                    mock.patch.object(research, "CONTAINER_CODE", str(ROOT)):
+                rc = research.cmd_snapshot("dl-abc.json")
+            self.assertNotEqual(rc, 0, "hash distinto no congela")
+            frozen = [json.loads(p.read_text(encoding="utf-8")).get("status")
+                      for p in (res / "snapshots").glob("snap-*.json")]
+            self.assertNotIn("FROZEN", frozen, f"nada FROZEN con hash distinto: {frozen}")
+
 
 class ResearchNativeCase(unittest.TestCase):
     def test_zip_sin_estrategia_o_sin_trades_no_es_exito(self):
@@ -840,6 +880,40 @@ class ResearchNativeCase(unittest.TestCase):
             self.assertIsNone(error, f"control valido sin error: {error}")
             self.assertEqual(summary["trades"], 6, "control: 6 trades")
 
+    def test_fees_nativas_son_costos_no_tasas(self):
+        from operations import research
+
+        import zipfile
+
+        def _native(tmpdir, name, trades):
+            native = Path(tmpdir) / name
+            native.mkdir()
+            with zipfile.ZipFile(str(native / "r.zip"), "w") as bundle:
+                bundle.writestr("backtest-result-a.json", json.dumps(
+                    {"SmaCrossBaseline": {"profit_total_abs": 1.0, "profit_total": 0.01,
+                                          "total_trades": len(trades),
+                                          "max_drawdown_abs": 0.5, "trades": trades}}))
+            return native
+
+        core = {"amount": 2.0, "open_rate": 100.0, "close_rate": 110.0,
+                "enter_tag": "sma_bull", "exit_reason": "sma_bear"}
+        with tempfile.TemporaryDirectory() as tmp:
+            rates = _native(tmp, "rates", [{**core, "fee_open": 0.001, "fee_close": 0.001}])
+            summary, error = research._summarize_native(rates)
+            self.assertIsNone(error, f"legible: {error}")
+            # 2*100*0.001 + 2*110*0.001 = 0.42 USDT, no 0.002.
+            self.assertAlmostEqual(summary["fees"], 0.42, delta=1e-9,
+                                   msg="tasas aplicadas a notionals")
+            costs = _native(tmp, "costs", [{**core, "fee_open": 0.001, "fee_close": 0.001,
+                                            "fee_open_cost": 0.2, "fee_close_cost": 0.22}])
+            summary, error = research._summarize_native(costs)
+            self.assertIsNone(error, f"legible: {error}")
+            self.assertAlmostEqual(summary["fees"], 0.42, delta=1e-9, msg="*_cost manda")
+            bare = _native(tmp, "bare", [dict(core)])
+            summary, error = research._summarize_native(bare)
+            self.assertIsNone(error, f"legible: {error}")
+            self.assertIsNone(summary["fees"], "sin componentes no hay fee inventada")
+
 
 class ResearchRefCoverageCase(unittest.TestCase):
     def test_cross_coverage_reconoce_exit_reason_sma_bear(self):
@@ -876,6 +950,48 @@ class ResearchRefCoverageCase(unittest.TestCase):
             self.assertTrue(info["has_enter_cross"], "entrada intacta")
             self.assertFalse(info["has_exit_cross"], "solo stop_loss no es salida por señal")
 
+    def test_ref_trades_expone_conteo_analizable(self):
+        from operations import research
+
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            native = Path(tmp) / "ref"
+            native.mkdir()
+            trades = [
+                {"enter_tag": "sma_bull", "exit_reason": "sma_bear"},
+                {"enter_tag": "sma_bull", "exit_reason": "stop_loss"},
+                {"enter_tag": "sma_bull", "exit_reason": "force_exit"},
+            ]
+            with zipfile.ZipFile(str(native / "r.zip"), "w") as bundle:
+                bundle.writestr("backtest-result-a.json", json.dumps(
+                    {"SmaCrossBaseline": {"profit_total_abs": 1.0, "profit_total": 0.01,
+                                          "total_trades": 3, "max_drawdown_abs": 0.5,
+                                          "trades": trades}}))
+            info, error = research._ref_trades(native)
+            self.assertIsNone(error, f"referencia legible: {error}")
+            self.assertEqual(info["count"], 3, "total cerrado intacto")
+            self.assertEqual(info["analyzable"], 2, "excluye force_exit terminal")
+
+    def test_lookahead_coverage_iguala_referencia_analizable(self):
+        from operations import research
+
+        helper = getattr(research, "_lookahead_coverage", None)
+        self.assertTrue(callable(helper), "helper propuesto para handshake")
+        native = ([{"enter_tag": "sma_bull", "exit_reason": "sma_bear"}] * 70
+                  + [{"enter_tag": "sma_bull", "exit_reason": "stop_loss"}] * 62
+                  + [{"enter_tag": "sma_bull", "exit_reason": "force_exit"}])
+        self.assertEqual(len(native), 133, "forma del ref nativo")
+        self.assertTrue(helper(132, native), "CSV132 cubre 133-1force")
+        self.assertFalse(helper(5, native), "CSV5 no cubre 132 esperados")
+        # Solo el exit_reason EXACTO 'force_exit' excluye (no substrings):
+        # 'not_force_exit' nunca lo emite el motor, pero el parser es robusto.
+        casi = [{"enter_tag": "sma_bull", "exit_reason": "not_force_exit"}]
+        self.assertTrue(helper(1, casi), "solo EXACTO force_exit excluye")
+        pares = [{"enter_tag": "sma_bull", "exit_reason": "sma_bear"}] * 2
+        self.assertFalse(helper(2.5, pares), "fraccion 2.5 no cubre aunque trunque a 2")
+        self.assertFalse(helper(-1, pares), "negativo no cubre")
+
 
 class ResearchLookaheadCase(unittest.TestCase):
     def test_csv_sesgo_baja_cobertura_y_ausente_no_dan_pass(self):
@@ -899,6 +1015,33 @@ class ResearchLookaheadCase(unittest.TestCase):
             parsed, error = research._parse_lookahead_csv(short)
             self.assertIsNone(error, f"CSV corto parsea: {error}")
             self.assertLess(parsed["total_signals"], 5, "cobertura <5: gate es INCONCLUSIVE")
+            strict = tmpdir / "strict.csv"
+            strict.write_text(header + "\n" + "f.csv,SmaCrossBaseline,1,132,0,0,\n",
+                              encoding="utf-8")
+            parsed, error = research._parse_lookahead_csv(strict)
+            self.assertIsNone(error, f"bool nativo 1 aceptado: {error}")
+            self.assertTrue(parsed["has_bias"], "1 nativo es True")
+            self.assertEqual(parsed["total_signals"], 132, "entero canonico aceptado")
+            zero = tmpdir / "zero.csv"
+            zero.write_text(header + "\n" + "f.csv,SmaCrossBaseline,0,0,0,0,\n",
+                            encoding="utf-8")
+            parsed, error = research._parse_lookahead_csv(zero)
+            self.assertIsNone(error, f"bool nativo 0 aceptado: {error}")
+            self.assertFalse(parsed["has_bias"], "0 nativo es False")
+            # Malformados no fabrican limpio: plan parser es INCONCLUSIVE.
+            malformed = [
+                ("has_bias vacio con conteos 0", "f.csv,SmaCrossBaseline,,0,0,0,\n"),
+                ("has_bias vacio con conteos 132", "f.csv,SmaCrossBaseline,,132,0,0,\n"),
+                ("total fraccionario", "f.csv,SmaCrossBaseline,False,132.5,0,0,\n"),
+                ("conteo negativo", "f.csv,SmaCrossBaseline,False,132,-1,0,\n"),
+            ]
+            for idx, (label, row) in enumerate(malformed):
+                with self.subTest(label=label):
+                    path = tmpdir / f"mal-{idx}.csv"
+                    path.write_text(header + "\n" + row, encoding="utf-8")
+                    parsed, error = research._parse_lookahead_csv(path)
+                    self.assertIsNone(parsed, f"{label}: sin parseado que pasar")
+                    self.assertIsNotNone(error, f"{label}: error, gate es INCONCLUSIVE")
             parsed, error = research._parse_lookahead_csv(tmpdir / "ausente.csv")
             self.assertIsNone(parsed, "sin CSV no hay parseado que pasar")
             self.assertIsNotNone(error, "sin CSV hay error: gate es INCONCLUSIVE")
@@ -940,6 +1083,98 @@ class ResearchOwnGateCase(unittest.TestCase):
 
 
 class ResearchBacktestCase(unittest.TestCase):
+    _TRADES_DOS = [
+        {"enter_tag": "sma_bull", "exit_reason": "sma_bear"},
+        {"enter_tag": "sma_bull", "exit_reason": "stop_loss"},
+    ]
+
+    def _frozen_eval_tree(self, tmp, specs):
+        """Snapshot FROZEN con feathers 1h; specs: (seg, meta_start, n, o, c[, frame_start])."""
+        from operations import research
+
+        res = Path(tmp) / "res"
+        snaps = res / "snapshots"
+        snap_dir = snaps / "snap-eval"
+        snap_dir.mkdir(parents=True)
+        whole_5m = snap_dir / research._pair_file("BTC/USDT", "5m")
+        whole_1h = snap_dir / research._pair_file("BTC/USDT", "1h")
+        whole_5m.write_bytes(os.urandom(32))
+        whole_1h.write_bytes(os.urandom(32))
+        metas = []
+        for idx, (seg, meta_start, n, o, c, *rest) in enumerate(specs):
+            frame_start = rest[0] if rest else meta_start
+            seg_dir = snap_dir / seg
+            seg_dir.mkdir(parents=True)
+            dates = pd.date_range(start=frame_start, periods=n, freq="1h", tz="UTC")
+            frame = DataFrame({
+                "date": dates,
+                "open": [float(o)] * n,
+                "high": [float(c) + 0.5] * n,
+                "low": [float(o) - 0.5] * n,
+                "close": [float(c)] * n,
+                "volume": [10.0] * n,
+            })
+            f5 = seg_dir / research._pair_file("BTC/USDT", "5m")
+            f1 = seg_dir / research._pair_file("BTC/USDT", "1h")
+            f5.write_bytes(os.urandom(16))
+            frame.to_feather(str(f1))
+            metas.append({
+                "index": idx,
+                "length": n,
+                "start": meta_start.isoformat(),
+                "end_exclusive": (meta_start + timedelta(hours=n)).isoformat(),
+                "eval_start": (meta_start + timedelta(hours=51)).isoformat(),
+                "seg_dir": seg,
+                "file_5m_sha256": launch.file_hash(f5),
+                "file_1h_sha256": launch.file_hash(f1),
+            })
+        manifest = {
+            "kind": research.SNAPSHOT_KIND, "status": "FROZEN",
+            "snapshot_id": "eval", "snapshot_dir": snap_dir.name,
+            "whole_5m_sha256": launch.file_hash(whole_5m),
+            "whole_1h_sha256": launch.file_hash(whole_1h),
+            "segments_meta": metas,
+        }
+        (snaps / "snap-eval.json").write_text(json.dumps(manifest), encoding="utf-8")
+        input_path = Path(tmp) / "input.json"
+        input_path.write_text(json.dumps({
+            "kind": research.INPUT_KIND, "status": "PREPARED",
+            "image_ref": launch.PINNED_IMAGE, "commit": BASELINE_COMMIT,
+            "input_id": "in1", **research._code_hashes(ROOT),
+        }), encoding="utf-8")
+        return res, input_path
+
+    @staticmethod
+    def _fake_backtest_engine(trades_by_seg):
+        import zipfile
+
+        def _run(argv, timeout_s, log_path):
+            args = [str(a) for a in argv]
+            seg = Path(args[args.index("--datadir") + 1]).name
+            export = Path(args[args.index("--export-directory") + 1])
+            trades = trades_by_seg[seg]
+            payload = {"SmaCrossBaseline": {
+                "profit_total_abs": 1.0, "profit_total": 0.01,
+                "total_trades": len(trades), "max_drawdown_abs": 0.5, "trades": trades}}
+            with zipfile.ZipFile(str(export / "r.zip"), "w") as bundle:
+                bundle.writestr("backtest-result-a.json", json.dumps(payload))
+            Path(log_path).write_text("ok", encoding="utf-8")
+            return 0, False
+
+        return _run
+
+    def _run_backtest_session(self, res, input_path, engine):
+        from operations import research
+
+        with mock.patch.object(research, "CONTAINER_RESEARCH", str(res)), \
+                mock.patch.object(research, "CONTAINER_INPUT", str(input_path)), \
+                mock.patch.object(research, "CONTAINER_CODE", str(ROOT)), \
+                mock.patch.object(research, "_run_streaming", side_effect=engine):
+            rc = research.cmd_backtest("snap-eval.json")
+        sessions = list((res / "sessions").glob("backtest-*/session.json"))
+        self.assertEqual(len(sessions), 1, f"una sesion: {sessions}")
+        return rc, json.loads(sessions[0].read_text(encoding="utf-8"))
+
     def test_backtest_usa_recortes_congelados_y_rango_efectivo(self):
         from operations import research
 
@@ -1020,6 +1255,167 @@ class ResearchBacktestCase(unittest.TestCase):
             self.assertEqual(len(sessions), 1, f"una sesion: {sessions}")
             session = json.loads(sessions[0].read_text(encoding="utf-8"))
             self.assertEqual(session.get("status"), "INCONCLUSIVE", session)
+
+    def test_cero_trades_es_inconclusive_aunque_ejecucion_ok(self):
+        # cmd_backtest importa pandas al arrancar: runtime autoritativo.
+        _require_market(self)
+        start = datetime(2021, 6, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            res, input_path = self._frozen_eval_tree(
+                tmp, [("seg00", start, 60, 100.0, 110.0)])
+            rc, session = self._run_backtest_session(
+                res, input_path, self._fake_backtest_engine({"seg00": []}))
+        self.assertEqual(rc, 1, "cero trades no es exito")
+        self.assertEqual(session.get("status"), "SUCCEEDED", "ejecucion nativa completa")
+        self.assertEqual(session.get("evaluation_status"), "INCONCLUSIVE", session)
+        runs = session.get("results", [])
+        self.assertEqual(len(runs), 4, f"4 fees ejecutadas: {runs}")
+        expected_pnl = {0.001: -1.9038462, 0.0015: -2.8557692,
+                        0.002: -3.8076923, 0.003: -5.7115385}
+        for entry in runs:
+            with self.subTest(fee=entry.get("fee")):
+                self.assertEqual(entry.get("status"), "SUCCEEDED")
+                self.assertEqual(entry.get("evaluation_status"), "INCONCLUSIVE")
+                bench = entry.get("benchmark_buyhold") or {}
+                self.assertEqual(bench.get("fee"), entry.get("fee"), "bench fee por run")
+                self.assertAlmostEqual(bench.get("pnl"), expected_pnl[entry["fee"]],
+                                       delta=1e-4, msg="terminal OPEN 100, no CLOSE 110")
+
+    def test_error_benchmark_es_failed_no_success(self):
+        _require_market(self)
+        start = datetime(2021, 6, 1, tzinfo=timezone.utc)
+        frame_start = datetime(2021, 1, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            res, input_path = self._frozen_eval_tree(
+                tmp, [("seg00", start, 60, 100.0, 110.0, frame_start)])
+            rc, session = self._run_backtest_session(
+                res, input_path, self._fake_backtest_engine({"seg00": self._TRADES_DOS}))
+        self.assertEqual(rc, 1, "bench roto no es exito")
+        self.assertEqual(session.get("status"), "FAILED", session)
+        for entry in session.get("results", []):
+            self.assertEqual(entry.get("status"), "FAILED")
+            self.assertIn("benchmark", str(entry.get("error", "")), entry)
+
+    def test_mezcla_valido_y_cero_es_partial_visible(self):
+        _require_market(self)
+        start = datetime(2021, 6, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            res, input_path = self._frozen_eval_tree(tmp, [
+                ("seg00", start, 60, 100.0, 110.0),
+                ("seg01", start, 60, 100.0, 110.0),
+            ])
+            rc, session = self._run_backtest_session(res, input_path,
+                                                     self._fake_backtest_engine(
+                                                         {"seg00": self._TRADES_DOS, "seg01": []}))
+        self.assertEqual(rc, 1, "partial no es exito")
+        self.assertEqual(session.get("status"), "SUCCEEDED", "ejecucion completa")
+        self.assertEqual(session.get("evaluation_status"), "PARTIAL", session)
+        by_seg = {}
+        for entry in session.get("results", []):
+            by_seg.setdefault(entry.get("segment"), []).append(entry.get("evaluation_status"))
+        self.assertTrue(all(s == "SUCCEEDED" for s in by_seg.get(0, [])), by_seg)
+        self.assertTrue(all(s == "INCONCLUSIVE" for s in by_seg.get(1, [])), by_seg)
+
+
+class ResearchBiasCase(unittest.TestCase):
+    def test_bias_sin_cobertura_cierra_gate_y_sesion(self):
+        from operations import research
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res = Path(tmp) / "res"
+            snaps = res / "snapshots"
+            snap_dir = snaps / "snap-corto"
+            snap_dir.mkdir(parents=True)
+            whole_5m = snap_dir / research._pair_file("BTC/USDT", "5m")
+            whole_1h = snap_dir / research._pair_file("BTC/USDT", "1h")
+            whole_5m.write_bytes(os.urandom(32))
+            whole_1h.write_bytes(os.urandom(32))
+            seg_dir = snap_dir / "seg00"
+            seg_dir.mkdir(parents=True)
+            seg_5m = seg_dir / research._pair_file("BTC/USDT", "5m")
+            seg_1h = seg_dir / research._pair_file("BTC/USDT", "1h")
+            seg_5m.write_bytes(os.urandom(32))
+            seg_1h.write_bytes(os.urandom(32))
+            (snaps / "snap-corto.json").write_text(json.dumps({
+                "kind": research.SNAPSHOT_KIND, "status": "FROZEN",
+                "snapshot_id": "corto", "snapshot_dir": snap_dir.name,
+                "whole_5m_sha256": launch.file_hash(whole_5m),
+                "whole_1h_sha256": launch.file_hash(whole_1h),
+                "segments_meta": [{
+                    "index": 0, "length": 60,
+                    "start": "2021-06-01T00:00:00+00:00",
+                    "end_exclusive": "2021-06-03T12:00:00+00:00",
+                    "seg_dir": "seg00",
+                    "file_5m_sha256": launch.file_hash(seg_5m),
+                    "file_1h_sha256": launch.file_hash(seg_1h),
+                }],
+            }), encoding="utf-8")
+            input_path = Path(tmp) / "input.json"
+            input_path.write_text(json.dumps({
+                "kind": research.INPUT_KIND, "status": "PREPARED",
+                "image_ref": launch.PINNED_IMAGE, "commit": BASELINE_COMMIT,
+                "input_id": "in1", **research._code_hashes(ROOT),
+            }), encoding="utf-8")
+            with mock.patch.object(research, "CONTAINER_RESEARCH", str(res)), \
+                    mock.patch.object(research, "CONTAINER_INPUT", str(input_path)), \
+                    mock.patch.object(research, "CONTAINER_CODE", str(ROOT)), \
+                    mock.patch.object(research, "_run_streaming",
+                                      side_effect=AssertionError("sin motor en early path")):
+                rc = research.cmd_bias("snap-corto.json")
+            self.assertEqual(rc, 1, "sin cobertura no es exito")
+            gates = list((res / "sessions").glob("bias-*/gate.json"))
+            sessions = list((res / "sessions").glob("bias-*/session.json"))
+            self.assertEqual(len(gates), 1, f"un gate: {gates}")
+            self.assertEqual(len(sessions), 1, f"una sesion: {sessions}")
+            gate = json.loads(gates[0].read_text(encoding="utf-8"))
+            session = json.loads(sessions[0].read_text(encoding="utf-8"))
+            self.assertEqual(gate.get("status"), "INCONCLUSIVE", gate)
+            self.assertEqual(gate.get("verdict"), "INCONCLUSIVE", gate)
+            self.assertEqual(session.get("status"), "INCONCLUSIVE", session)
+            self.assertNotEqual(session.get("status"), "RUNNING", "terminal tras finish")
+
+    def test_verdict_status_mapea(self):
+        from operations import research
+
+        self.assertEqual(research._verdict_status("PASS"), "SUCCEEDED")
+        self.assertEqual(research._verdict_status("FAIL"), "FAILED")
+        self.assertEqual(research._verdict_status("INCONCLUSIVE"), "INCONCLUSIVE")
+        self.assertEqual(research._verdict_status("OTRO"), "INCONCLUSIVE")
+
+
+class ResearchBenchmarkCase(unittest.TestCase):
+    def test_buyhold_fees_fuera_del_principal_y_retorno_sobre_wallet(self):
+        from operations import research
+
+        # 10000*0.99 = 9900 disponibles; cap = min(1000, 990, 24.75/0.026).
+        for fee, pnl in [(0.001, -1.9038462), (0.003, -5.7115385)]:
+            with self.subTest(fee=fee):
+                got = research.buyhold_for_segment(100.0, 100.0, 10000.0, fee)
+                self.assertAlmostEqual(got["cap"], 951.9230769, delta=1e-6)
+                self.assertAlmostEqual(got["pnl"], pnl, delta=1e-6)
+                self.assertAlmostEqual(got["return"], pnl / 10000.0, delta=1e-9,
+                                       msg="retorno sobre wallet, no sobre cap")
+
+
+class ResearchStreamingCase(unittest.TestCase):
+    def test_run_streaming_fsync_eio_no_es_exito_silencioso(self):
+        from operations import research
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(os, "fsync", side_effect=OSError("EIO")):
+                with self.assertRaises(OSError, msg="fsync EIO no es exito"):
+                    research._run_streaming(["true"], 30, Path(tmp) / "x.log")
+
+    def test_run_streaming_error_lector_no_es_exito_silencioso(self):
+        from operations import research
+
+        proc = mock.MagicMock()
+        proc.stdout.read.side_effect = OSError("EIO lector")
+        proc.wait.return_value = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(research.subprocess, "Popen", return_value=proc):
+                with self.assertRaises(OSError, msg="error de lector no es exito"):
+                    research._run_streaming(["x"], 30, Path(tmp) / "x.log")
 
 
 class ResearchCliCase(unittest.TestCase):

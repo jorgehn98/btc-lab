@@ -539,6 +539,7 @@ def _run(profile, code_root, storage_root, input_path) -> int:
     if profile not in _POLICIES:
         raise ValueError(f"perfil desconocido: {profile!r}")
     policy = _POLICIES[profile]
+    code, store = _require_container_roots(code_root, storage_root)
     try:
         manifest_in = json.loads(Path(input_path).read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -550,8 +551,6 @@ def _run(profile, code_root, storage_root, input_path) -> int:
         _check_input_manifest(manifest_in)
     else:
         _check_baseline_input_manifest(manifest_in)
-
-    code, store = _require_container_roots(code_root, storage_root)
 
     if profile == "smoke":
         config, _ = _load_config(code)

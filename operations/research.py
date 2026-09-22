@@ -131,32 +131,51 @@ def _baseline_cap(wallet: float = 10000.0) -> float:
     return min(1000.0, 0.10 * wallet, (0.0025 * wallet) / 0.026)
 
 
-def buyhold_for_segment(first_open: float, last_close: float,
-                        wallet: float = 10000.0, fee: float = 0.001) -> dict:
-    """Benchmark buy-and-hold aproximado con exposición limitada y fees fijas.
+def buyhold_for_segment(first_open: float, last_open: float,
+                        wallet: float = 10000.0, fee: float = 0.001,
+                        tradable_balance_ratio: float = 0.99) -> dict:
+    """Benchmark buy-and-hold comparable por friccion.
 
-    Este cálculo de fees es un proxy comparativo, no sustituye el modelo de
-    ejecución detallado de 5m del motor.
+    Exposicion cap sobre wallet disponible (wallet*ratio, como el motor) con la
+    misma formula de riesgo; compra en el open efectivo inicial y venta en el
+    open de la ultima vela (el motor cierra lo abierto al ultimo open
+    disponible). Fees fuera del principal: qty=cap/first_open y
+    pnl=qty*last_open*(1-fee)-cap*(1+fee). Retorno sobre wallet de cuenta.
     """
     import math
 
-    cap = _baseline_cap(wallet)
-    for value in (first_open, last_close):
+    try:
+        ratio = float(tradable_balance_ratio)
+    except (TypeError, ValueError):
+        raise ValueError("tradable_balance_ratio no numerico")
+    if not math.isfinite(ratio) or not 0.0 < ratio <= 1.0:
+        raise ValueError("tradable_balance_ratio fuera de (0,1]")
+    available = float(wallet) * ratio
+    cap = _baseline_cap(available)
+    for value in (first_open, last_open):
         if not math.isfinite(float(value)) or float(value) <= 0.0:
-            raise ValueError("open/close de segmento no valido para buyhold")
+            raise ValueError("open de segmento no valido para buyhold")
+    if not math.isfinite(float(fee)) or float(fee) < 0.0:
+        raise ValueError("fee no valida para buyhold")
     first = float(first_open)
-    last = float(last_close)
-    btc = (cap * (1.0 - fee)) / first
-    value_end = btc * last * (1.0 - fee)
-    pnl = value_end - cap
+    last = float(last_open)
+    fee = float(fee)
+    qty = cap / first
+    end_value = qty * last * (1.0 - fee)
+    cost = cap * (1.0 + fee)
+    pnl = end_value - cost
     return {
         "cap": cap,
+        "wallet": float(wallet),
+        "available": available,
+        "tradable_balance_ratio": ratio,
         "first_open": first,
-        "last_close": last,
+        "last_open": last,
         "fee": fee,
-        "end_value": value_end,
+        "end_value": end_value,
         "pnl": pnl,
-        "return": pnl / cap,
+        "return": pnl / float(wallet),
+        "position_return": pnl / cap,
         "cash_return": 0.0,
     }
 
@@ -277,6 +296,7 @@ def _run_streaming(argv: list, timeout_s: int, log_path: Path) -> tuple:
     )
     chunks: collections.deque = collections.deque()
     total = [0]
+    errors: list = []
 
     def _pump() -> None:
         try:
@@ -290,17 +310,18 @@ def _run_streaming(argv: list, timeout_s: int, log_path: Path) -> tuple:
                 while total[0] > _RUN_LOG_CAP and chunks:
                     old = chunks.popleft()
                     total[0] -= len(old)
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(exc)
         finally:
             try:
                 if proc.stdout is not None:
                     proc.stdout.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(exc)
 
     reader = threading.Thread(target=_pump, daemon=True)
     reader.start()
+    cleanup_error = None
     try:
         returncode = proc.wait(timeout=timeout_s)
         timed_out = False
@@ -308,23 +329,43 @@ def _run_streaming(argv: list, timeout_s: int, log_path: Path) -> tuple:
         proc.kill()
         try:
             proc.wait(timeout=30)
-        except Exception:
-            pass
+        except Exception as exc:
+            cleanup_error = exc
         returncode = None
         timed_out = True
     finally:
         reader.join(timeout=30)
-    tail = b"".join(chunks)
-    with open(log_path, "wb") as handle:
-        handle.write(header)
-        handle.write(tail)
-        if timed_out:
-            handle.write(f"\nTIMEOUT after {timeout_s}s\n".encode("utf-8", errors="replace"))
-        handle.flush()
-        try:
+
+    def _write(tail_bytes: bytes) -> None:
+        with open(log_path, "wb") as handle:
+            handle.write(header)
+            handle.write(tail_bytes)
+            if timed_out:
+                handle.write(f"\nTIMEOUT after {timeout_s}s\n".encode("utf-8", errors="replace"))
+            handle.flush()
             os.fsync(handle.fileno())
+
+    tail = b"".join(chunks)
+    if reader.is_alive():
+        try:
+            _write(tail)
         except OSError:
             pass
+        raise OSError("reader sin terminar tras join")
+    if errors:
+        primary = errors[0]
+        try:
+            _write(tail)
+        except OSError:
+            pass
+        raise OSError(f"reader: {type(primary).__name__}") from primary
+    if cleanup_error is not None:
+        try:
+            _write(tail)
+        except OSError:
+            pass
+        raise OSError(f"cleanup: {type(cleanup_error).__name__}") from cleanup_error
+    _write(tail)
     return returncode, timed_out
 
 
@@ -446,6 +487,12 @@ def cmd_download() -> int:
                                                        "error": f"ejecutable ausente: {exc}"})
                 print(f"download: FAILED {exc}", file=sys.stderr)
                 return 1
+            except OSError as exc:
+                launch._atomic_replace(manifest_path, {**base, "status": "FAILED",
+                                                       "finished_at": _utcnow_iso(),
+                                                       "error": f"{type(exc).__name__}: {exc}"})
+                print(f"download: FAILED {exc}", file=sys.stderr)
+                return 1
             if timed_out or returncode is None:
                 launch._atomic_replace(manifest_path, {**base, "status": "INCOMPLETE",
                                                        "finished_at": _utcnow_iso(),
@@ -526,7 +573,13 @@ def cmd_snapshot(download_ref: str) -> int:
     try:
         if not expected_5m.is_file():
             raise FileNotFoundError(f"falta {expected_5m.name} exacto Freqtrade")
+        frozen_hash = launch.file_hash(expected_5m)
+        if not dl_manifest.get("data_file_sha256") or frozen_hash != dl_manifest.get("data_file_sha256"):
+            raise ValueError("feather 5m modificado tras download")
     except OSError as exc:
+        print(f"snapshot: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
         print(f"snapshot: {exc}", file=sys.stderr)
         return 1
     try:
@@ -552,6 +605,8 @@ def cmd_snapshot(download_ref: str) -> int:
             }
             launch._atomic_create_new(manifest_path, {**base})
             try:
+                if launch.file_hash(expected_5m) != dl_manifest.get("data_file_sha256"):
+                    raise ValueError("feather 5m modificado tras download")
                 frame_5m = _load_5m_frame([str(expected_5m)])
                 validate_ohlcv(frame_5m, TRAIN_START, TRAIN_END, 5)
                 hourly = aggregate_hourly(frame_5m)
@@ -750,18 +805,40 @@ def _summarize_native(native_dir: Path) -> tuple:
     drawdown = _num_or_none(strat.get("max_drawdown_abs"))
     if drawdown is None:
         drawdown = _num_or_none(strat.get("max_drawdown_account"))
-    fees = _num_or_none(strat.get("total_fees"))
-    if fees is None:
-        # Usa fees por trade si faltan las fees agregadas.
+    # Fees nativas son costos en USDT por trade (long spot cerrado, sin DCA):
+    # se prefiere fee_open_cost+fee_close_cost y si no amount*open_rate*fee_open
+    # + amount*close_rate*fee_close. Sin componentes completos no se inventa.
+    fees = None
+    fee_trades = strat.get("trades")
+    if isinstance(fee_trades, list):
         try:
             fee_sum = 0.0
-            seen = False
-            for trade in strat.get("trades") or []:
-                for key in ("fee_open", "fee_close", "fee"):
-                    if trade.get(key) is not None:
-                        fee_sum += float(trade.get(key))
-                        seen = True
-            fees = fee_sum if seen else None
+            for trade in fee_trades:
+                if not isinstance(trade, dict):
+                    raise ValueError("trade no es objeto")
+                foc = _num_or_none(trade.get("fee_open_cost"))
+                fcc = _num_or_none(trade.get("fee_close_cost"))
+                if foc is not None or fcc is not None:
+                    if foc is None or fcc is None or foc < 0.0 or fcc < 0.0:
+                        raise ValueError("costos incompletos")
+                    for key in ("fee_open_currency", "fee_close_currency", "fee_currency"):
+                        cur = trade.get(key)
+                        if cur not in (None, "", "USDT"):
+                            raise ValueError("fee en otra moneda")
+                    fee_sum += foc + fcc
+                    continue
+                amount = _num_or_none(trade.get("amount"))
+                open_rate = _num_or_none(trade.get("open_rate"))
+                close_rate = _num_or_none(trade.get("close_rate"))
+                fee_open = _num_or_none(trade.get("fee_open"))
+                fee_close = _num_or_none(trade.get("fee_close"))
+                if (amount is None or amount <= 0.0 or open_rate is None or open_rate <= 0.0
+                        or close_rate is None or close_rate <= 0.0
+                        or fee_open is None or fee_open < 0.0
+                        or fee_close is None or fee_close < 0.0):
+                    raise ValueError("componentes de fee incompletos")
+                fee_sum += amount * open_rate * fee_open + amount * close_rate * fee_close
+            fees = fee_sum
         except (TypeError, ValueError):
             fees = None
     summary: dict = {
@@ -775,12 +852,6 @@ def _summarize_native(native_dir: Path) -> tuple:
         "inner": inner_name,
     }
     reasons: dict = {}
-    if profit_abs is None:
-        reasons["profit_abs"] = "informe sin profit_total_abs"
-    if port_return is None:
-        reasons["portfolio_return"] = "informe sin profit_total"
-    if trades is None:
-        reasons["trades"] = "informe sin total_trades"
     if drawdown is None:
         reasons["drawdown"] = "informe sin drawdown"
     if fees is None:
@@ -788,10 +859,7 @@ def _summarize_native(native_dir: Path) -> tuple:
     reasons["exposure"] = "exposicion no expuesta por el informe nativo"
     if reasons:
         summary["null_reasons"] = reasons
-    try:
-        summary["trade_list"] = strat.get("trades") or []
-    except Exception:
-        summary["trade_list"] = []
+    summary["trade_list"] = list(strat.get("trades") or [])
     return summary, None
 
 
@@ -843,8 +911,10 @@ def cmd_backtest(snapshot_ref: str) -> int:
                         and m.get("start") and m.get("end_exclusive")]
             results: list = []
             failed = 0
+            aborted = False
             if not eligible:
                 launch._atomic_replace(manifest_path, {**base, "status": "INCONCLUSIVE",
+                                                       "evaluation_status": "INCONCLUSIVE",
                                                        "finished_at": _utcnow_iso(),
                                                        "reason": "sin segmentos evaluables",
                                                        "results": results,
@@ -859,6 +929,7 @@ def cmd_backtest(snapshot_ref: str) -> int:
                     str(meta["end_exclusive"]).replace("Z", "+00:00"))
                 if eval_dt >= end_dt:
                     results.append({"segment": meta.get("index"), "status": "INCONCLUSIVE",
+                                    "evaluation_status": "INCONCLUSIVE",
                                     "reason": "warmup 51 cubre todo el segmento"})
                     continue
                 timerange = _timerange_for_eval(eval_dt, end_dt)
@@ -869,23 +940,9 @@ def cmd_backtest(snapshot_ref: str) -> int:
                     seg_frame["date"] = pd.to_datetime(seg_frame["date"], utc=True)
                     mask = (seg_frame["date"] >= eval_dt) & (seg_frame["date"] < end_dt)
                     eval_rows = seg_frame.loc[mask].sort_values("date").reset_index(drop=True)
-                    bench = None
-                    bench_error = None
-                    if len(eval_rows):
-                        try:
-                            bench = buyhold_for_segment(
-                                float(eval_rows["open"].iloc[0]),
-                                float(eval_rows["close"].iloc[-1]), 10000.0, BASE_FEE)
-                            bench["method"] = (
-                                "cap min(1000,10% wallet,0.25% wallet/0.026)~961.54, "
-                                "open primera eval -> close ultima eval, costes ambos lados; "
-                                "aproximado, motor usa detalle 5m")
-                        except Exception as exc:
-                            bench_error = f"{type(exc).__name__}: {exc}"
-                    else:
-                        bench_error = "sin velas en rango efectivo"
+                    eval_error = None if len(eval_rows) else "sin velas en rango efectivo"
                 except Exception as exc:
-                    bench, bench_error = None, f"{type(exc).__name__}: {exc}"
+                    eval_rows, eval_error = None, f"{type(exc).__name__}: {exc}"
                 for fee in FEES:
                     run_dir = session_dir / f"seg{int(meta['index']):02d}_fee{str(fee).replace('.', 'p')}"
                     run_dir.mkdir(parents=True, exist_ok=False)
@@ -901,20 +958,30 @@ def cmd_backtest(snapshot_ref: str) -> int:
                     try:
                         returncode, timed_out = _run_streaming(argv, BACKTEST_TIMEOUT_S, log_path)
                     except FileNotFoundError as exc:
-                        entry.update({"status": "FAILED",
+                        entry.update({"status": "FAILED", "evaluation_status": "FAILED",
                                       "error": f"ejecutable ausente: {exc}"})
                         failed += 1
                         results.append(entry)
                         continue
+                    except OSError as exc:
+                        # Sin proceso confirmado terminado no hay replay del
+                        # siguiente job: se aborta la sesion completa.
+                        entry.update({"status": "FAILED", "evaluation_status": "FAILED",
+                                      "error": f"{type(exc).__name__}: {exc}"})
+                        failed += 1
+                        results.append(entry)
+                        aborted = True
+                        break
                     entry.update({"exit_code": returncode, "timed_out": timed_out,
                                   "logfile": str(log_path)})
                     if timed_out or returncode is None:
-                        entry.update({"status": "FAILED", "error": "timeout"})
+                        entry.update({"status": "FAILED", "evaluation_status": "FAILED",
+                                      "error": "timeout"})
                         failed += 1
                         results.append(entry)
                         continue
                     if returncode != 0:
-                        entry.update({"status": "FAILED",
+                        entry.update({"status": "FAILED", "evaluation_status": "FAILED",
                                       "error": f"exit {returncode}",
                                       "log_tail": _read_tail(log_path, 8192)})
                         failed += 1
@@ -922,24 +989,65 @@ def cmd_backtest(snapshot_ref: str) -> int:
                         continue
                     summary, parse_error = _summarize_native(export_dir)
                     if parse_error or summary is None:
-                        entry.update({"status": "FAILED", "error": parse_error})
+                        entry.update({"status": "FAILED", "evaluation_status": "FAILED",
+                                      "error": parse_error})
                         failed += 1
                         results.append(entry)
                         continue
-                    entry.update({"status": "SUCCEEDED", "summary": summary})
-                    if bench is not None:
-                        entry["benchmark_buyhold"] = bench
-                    if bench_error is not None:
-                        entry["benchmark_error"] = bench_error
-                    entry["benchmark_cash"] = {"return": 0.0}
+                    try:
+                        if eval_rows is None or not len(eval_rows):
+                            raise ValueError(eval_error or "sin velas en rango efectivo")
+                        bench = buyhold_for_segment(
+                            float(eval_rows["open"].iloc[0]),
+                            float(eval_rows["open"].iloc[-1]), 10000.0, float(fee))
+                        bench["first_date"] = eval_rows["date"].iloc[0].isoformat()
+                        bench["last_date"] = eval_rows["date"].iloc[-1].isoformat()
+                        bench["timerange"] = timerange
+                        bench["method"] = (
+                            "cap sobre wallet disponible (10000*0.99) con misma formula "
+                            "de riesgo; open primera eval -> open ultima 1h (cierre "
+                            "motor al ultimo open); fees fuera del principal; "
+                            "aproximado, motor usa detalle 5m")
+                    except Exception as exc:
+                        entry.update({"status": "FAILED", "evaluation_status": "FAILED",
+                                      "error": f"benchmark: {type(exc).__name__}: {exc}",
+                                      "summary": summary})
+                        failed += 1
+                        results.append(entry)
+                        continue
+                    entry.update({"status": "SUCCEEDED", "summary": summary,
+                                  "benchmark_buyhold": bench,
+                                  "benchmark_cash": {"return": 0.0}})
+                    if int(summary.get("trades", 0)) > 0:
+                        entry["evaluation_status"] = "SUCCEEDED"
+                    else:
+                        entry["evaluation_status"] = "INCONCLUSIVE"
+                        entry["evaluation_reason"] = (
+                            "cero trades: nativo completo pero no evaluable, sin exito economico")
                     results.append(entry)
+                if aborted:
+                    break
+            # Estado de ejecucion nativa distinto del gate de evaluacion.
+            scoped = [r for r in results if r.get("status") in ("SUCCEEDED", "INCONCLUSIVE")]
+            tradeable = [r for r in scoped
+                         if r.get("status") == "SUCCEEDED"
+                         and int((r.get("summary") or {}).get("trades", 0)) > 0]
+            if failed > 0:
+                evaluation = "FAILED"
+            elif not scoped or not tradeable:
+                evaluation = "INCONCLUSIVE"
+            elif len(tradeable) == len(scoped):
+                evaluation = "SUCCEEDED"
+            else:
+                evaluation = "PARTIAL"
             status = "SUCCEEDED" if failed == 0 else "FAILED"
             launch._atomic_replace(manifest_path, {**base, "status": status,
+                                                   "evaluation_status": evaluation,
                                                    "finished_at": _utcnow_iso(),
                                                    "results": results,
                                                    "session_dir": str(session_dir)})
             print(str(manifest_path))
-            return 0 if failed == 0 else 1
+            return 0 if (failed == 0 and evaluation == "SUCCEEDED") else 1
     except RuntimeError as exc:
         print(f"backtest: {exc}", file=sys.stderr)
         return 1
@@ -947,6 +1055,11 @@ def cmd_backtest(snapshot_ref: str) -> int:
 
 def _timerange_for_eval(eval_start_dt, end_exclusive_dt) -> str:
     return _timerange_fmt(eval_start_dt, end_exclusive_dt)
+
+
+def _verdict_status(verdict: str) -> str:
+    """Mapeo uniforme veredicto -> estado terminal: PASS/FAIL/resto."""
+    return {"PASS": "SUCCEEDED", "FAIL": "FAILED"}.get(verdict, "INCONCLUSIVE")
 
 
 def _parse_lookahead_csv(csv_path: Path) -> tuple:
@@ -976,16 +1089,20 @@ def _parse_lookahead_csv(csv_path: Path) -> tuple:
 
     def _as_bool(raw) -> bool | None:
         text_value = str(raw or "").strip().lower()
-        if text_value in ("true", "1", "yes", "y"):
+        if text_value in ("true", "1"):
             return True
-        if text_value in ("false", "0", "no", "n", ""):
-            # "" se trata como False solo si hay conteos; si no, el llamador decide.
+        if text_value in ("false", "0"):
             return False
         return None
 
     def _as_int(raw):
+        import re
+
+        text_value = str(raw or "").strip()
+        if not re.fullmatch(r"\d+", text_value):
+            return None
         try:
-            return int(float(str(raw or "").strip() or "nan"))
+            return int(text_value)
         except (TypeError, ValueError):
             return None
 
@@ -1012,20 +1129,51 @@ def _ref_trades(native_dir: Path) -> tuple:
         return None, error or "sin resumen de referencia"
     trades = summary.get("trade_list") or []
     if not trades:
-        return {"count": 0, "has_enter_cross": False,
-                "has_exit_cross": False, "trades": []}, None
+        return {"count": 0, "analyzable": 0, "excluded": [],
+                "has_enter_cross": False, "has_exit_cross": False, "trades": []}, None
     has_enter = False
     has_exit = False
+    excluded: list = []
     for trade in trades:
         enter_tag = str(trade.get("enter_tag") or "")
         exit_tag = str(trade.get("exit_tag") or "")
         exit_reason = str(trade.get("exit_reason") or "")
+        if exit_reason == "force_exit":
+            excluded.append({"exit_reason": exit_reason})
+            continue
         if enter_tag == "sma_bull":
             has_enter = True
         if exit_tag == "sma_bear" or exit_reason in ("sma_bear", "exit_signal"):
             has_exit = True
-    return {"count": len(trades), "has_enter_cross": has_enter,
+    return {"count": len(trades), "analyzable": len(trades) - len(excluded),
+            "excluded": excluded, "has_enter_cross": has_enter,
             "has_exit_cross": has_exit, "trades": trades}, None
+
+
+def _lookahead_coverage(parsed_count, trades) -> bool:
+    """El CSV lookahead cubre la referencia analizable (sin force_exit terminal).
+
+    Solo el exit_reason EXACTO 'force_exit' excluye; el conteo debe ser un
+    entero >= 0 exacto (fracciones y negativos rechazan).
+    """
+    if isinstance(parsed_count, bool):
+        return False
+    if isinstance(parsed_count, int):
+        count = parsed_count
+    elif isinstance(parsed_count, float):
+        if not parsed_count.is_integer():
+            return False
+        count = int(parsed_count)
+    else:
+        return False
+    if count < 0:
+        return False
+    try:
+        expected = sum(1 for trade in (trades or [])
+                       if str((trade or {}).get("exit_reason") or "") != "force_exit")
+    except (TypeError, ValueError):
+        return False
+    return count == expected
 
 
 def _own_sma_gate(seg_1h_path: Path) -> dict:
@@ -1154,8 +1302,8 @@ def cmd_bias(snapshot_ref: str) -> int:
             launch._atomic_create_new(manifest_path, {**base})
             if target is None or not target.get("start") or not target.get("end_exclusive"):
                 verdict = {"verdict": "INCONCLUSIVE", "reason": "sin segmento objetivo"}
-                launch._atomic_create_new(gate_path, {**base, **verdict,
-                                                      "finished_at": _utcnow_iso()})
+                launch._atomic_create_new(gate_path, {**base, "status": "INCONCLUSIVE",
+                                                      **verdict, "finished_at": _utcnow_iso()})
                 launch._atomic_replace(manifest_path, {**base, "status": "INCONCLUSIVE",
                                                        "finished_at": _utcnow_iso(), **verdict})
                 return 1
@@ -1163,8 +1311,8 @@ def cmd_bias(snapshot_ref: str) -> int:
                 # El análisis recursive exige 1.000 velas; menos es inconcluyente.
                 verdict = {"verdict": "INCONCLUSIVE",
                            "reason": f"cobertura insuficiente (<{MIN_RECURSIVE_BARS} velas)"}
-                launch._atomic_create_new(gate_path, {**base, **verdict,
-                                                      "finished_at": _utcnow_iso()})
+                launch._atomic_create_new(gate_path, {**base, "status": "INCONCLUSIVE",
+                                                      **verdict, "finished_at": _utcnow_iso()})
                 launch._atomic_replace(manifest_path, {**base, "status": "INCONCLUSIVE",
                                                        "finished_at": _utcnow_iso(), **verdict})
                 return 1
@@ -1183,26 +1331,32 @@ def cmd_bias(snapshot_ref: str) -> int:
             ref_user.mkdir(parents=True, exist_ok=False)
             ref_argv = _backtest_argv(seg_dir, ref_user, timerange, BASE_FEE, ref_native)
             ref_log = ref_dir / "backtest.log"
-            ref_rc, ref_timeout = _run_streaming(ref_argv, BIAS_TIMEOUT_S, ref_log)
+            try:
+                ref_rc, ref_timeout = _run_streaming(ref_argv, BIAS_TIMEOUT_S, ref_log)
+                ref_exec_error = None
+            except OSError as exc:
+                ref_rc, ref_timeout = None, False
+                ref_exec_error = f"{type(exc).__name__}: {exc}"
             ref_info, ref_error = (None, None)
-            if not ref_timeout and ref_rc == 0:
+            if ref_exec_error is None and not ref_timeout and ref_rc == 0:
                 ref_info, ref_error = _ref_trades(ref_native)
-            if ref_timeout or ref_rc != 0 or ref_error or not ref_info:
-                reason = ref_error or f"referencia no concluyo (rc={ref_rc})"
+            if ref_exec_error or ref_timeout or ref_rc != 0 or ref_error or not ref_info:
+                reason = ref_exec_error or ref_error or f"referencia no concluyo (rc={ref_rc})"
                 verdict = {"verdict": "INCONCLUSIVE", "reason": reason,
                            "evidence": {"ref_argv": [str(a) for a in ref_argv],
                                         "ref_rc": ref_rc, "ref_timeout": ref_timeout}}
-                launch._atomic_create_new(gate_path, {**base, **verdict,
-                                                      "finished_at": _utcnow_iso()})
+                launch._atomic_create_new(gate_path, {**base, "status": "INCONCLUSIVE",
+                                                      **verdict, "finished_at": _utcnow_iso()})
                 launch._atomic_replace(manifest_path, {**base, "status": "INCONCLUSIVE",
                                                        "finished_at": _utcnow_iso(), **verdict})
                 return 1
-            if int(ref_info.get("count", 0)) < MIN_TRADES_LOOKAHEAD:
+            if int(ref_info.get("analyzable", ref_info.get("count", 0))) < MIN_TRADES_LOOKAHEAD:
                 verdict = {"verdict": "INCONCLUSIVE",
-                           "reason": f"solo {ref_info.get('count')} trades (<5)",
-                           "evidence": {"ref_trades": ref_info.get("count")}}
-                launch._atomic_create_new(gate_path, {**base, **verdict,
-                                                      "finished_at": _utcnow_iso()})
+                           "reason": f"solo {ref_info.get('analyzable')} analizables (<5)",
+                           "evidence": {"ref_trades": ref_info.get("count"),
+                                        "analyzable": ref_info.get("analyzable")}}
+                launch._atomic_create_new(gate_path, {**base, "status": "INCONCLUSIVE",
+                                                      **verdict, "finished_at": _utcnow_iso()})
                 launch._atomic_replace(manifest_path, {**base, "status": "INCONCLUSIVE",
                                                        "finished_at": _utcnow_iso(), **verdict})
                 return 1
@@ -1210,8 +1364,8 @@ def cmd_bias(snapshot_ref: str) -> int:
                 verdict = {"verdict": "INCONCLUSIVE",
                            "reason": "sin cobertura de ambos cruces en trades reales "
                                      "(stop solo no acredita salida)"}
-                launch._atomic_create_new(gate_path, {**base, **verdict,
-                                                      "finished_at": _utcnow_iso()})
+                launch._atomic_create_new(gate_path, {**base, "status": "INCONCLUSIVE",
+                                                      **verdict, "finished_at": _utcnow_iso()})
                 launch._atomic_replace(manifest_path, {**base, "status": "INCONCLUSIVE",
                                                        "finished_at": _utcnow_iso(), **verdict})
                 return 1
@@ -1237,31 +1391,48 @@ def cmd_bias(snapshot_ref: str) -> int:
                 "--lookahead-analysis-exportfilename", str(look_csv),
             ]
             look_log = look_dir / "lookahead.log"
-            look_rc, look_timeout = _run_streaming(look_argv, BIAS_TIMEOUT_S, look_log)
+            try:
+                look_rc, look_timeout = _run_streaming(look_argv, BIAS_TIMEOUT_S, look_log)
+                look_exec_error = None
+            except OSError as exc:
+                look_rc, look_timeout = None, False
+                look_exec_error = f"{type(exc).__name__}: {exc}"
             # 3) Análisis recursive nativo más el gate independiente de estrategia.
-            rec_dir = session_dir / "recursive"
-            rec_dir.mkdir(parents=True, exist_ok=False)
-            rec_user = rec_dir / "user_data"
-            rec_user.mkdir(parents=True, exist_ok=False)
-            rec_argv = [
-                "freqtrade", "recursive-analysis",
-                "--config", CONTAINER_CONFIG,
-                "--datadir", str(seg_dir),
-                "--userdir", str(rec_user),
-                "--strategy", STRATEGY_NAME,
-                "--strategy-path", CONTAINER_STRATEGY_PATH,
-                "--timeframe", TRAIN_TIMEFRAME_1H,
-                "--timerange", timerange,
-                "--startup-candle", *[str(s) for s in STARTUP_LIST],
-            ]
-            rec_log = rec_dir / "recursive.log"
-            rec_rc, rec_timeout = _run_streaming(rec_argv, BIAS_TIMEOUT_S, rec_log)
+            # Si lookahead fallo a nivel ejecucion no se lanza otro nativo que
+            # pueda solaparse con un proceso sin terminar confirmado.
+            rec_argv: list = []
+            rec_log = session_dir / "recursive.log"
+            rec_rc, rec_timeout, rec_exec_error = None, False, None
+            if look_exec_error is None:
+                rec_dir = session_dir / "recursive"
+                rec_dir.mkdir(parents=True, exist_ok=False)
+                rec_user = rec_dir / "user_data"
+                rec_user.mkdir(parents=True, exist_ok=False)
+                rec_argv = [
+                    "freqtrade", "recursive-analysis",
+                    "--config", CONTAINER_CONFIG,
+                    "--datadir", str(seg_dir),
+                    "--userdir", str(rec_user),
+                    "--strategy", STRATEGY_NAME,
+                    "--strategy-path", CONTAINER_STRATEGY_PATH,
+                    "--timeframe", TRAIN_TIMEFRAME_1H,
+                    "--timerange", timerange,
+                    "--startup-candle", *[str(s) for s in STARTUP_LIST],
+                ]
+                rec_log = rec_dir / "recursive.log"
+                try:
+                    rec_rc, rec_timeout = _run_streaming(rec_argv, BIAS_TIMEOUT_S, rec_log)
+                except OSError as exc:
+                    rec_exec_error = f"{type(exc).__name__}: {exc}"
             own = _own_sma_gate(seg_dir / _pair_file(TRAIN_PAIR, TRAIN_TIMEFRAME_1H))
             look_parsed, look_error = (None, None)
-            if not look_timeout and look_rc == 0:
+            if look_exec_error is None and not look_timeout and look_rc == 0:
                 look_parsed, look_error = _parse_lookahead_csv(look_csv)
             # Decide con evidencia estructurada, no por un substring del log.
-            if look_timeout or rec_timeout:
+            if look_exec_error or rec_exec_error:
+                verdict = {"verdict": "INCONCLUSIVE",
+                           "reason": look_exec_error or rec_exec_error}
+            elif look_timeout or rec_timeout:
                 verdict = {"verdict": "INCONCLUSIVE", "reason": "timeout en analisis nativo"}
             elif look_rc != 0:
                 tail = _read_tail(look_log, 8192).lower()
@@ -1278,6 +1449,11 @@ def cmd_bias(snapshot_ref: str) -> int:
             elif int(look_parsed["total_signals"]) < MIN_TRADES_LOOKAHEAD:
                 verdict = {"verdict": "INCONCLUSIVE",
                            "reason": f"lookahead solo {look_parsed['total_signals']} trades"}
+            elif not _lookahead_coverage(look_parsed["total_signals"], ref_info.get("trades")):
+                verdict = {"verdict": "INCONCLUSIVE",
+                           "reason": "lookahead incompleto frente a la referencia analizable",
+                           "evidence": {"lookahead_total": look_parsed["total_signals"],
+                                        "analyzable": ref_info.get("analyzable")}}
             elif look_parsed["has_bias"] or look_parsed["biased_entry_signals"] > 0 \
                     or look_parsed["biased_exit_signals"] > 0 \
                     or look_parsed["biased_indicators"]:
@@ -1301,7 +1477,7 @@ def cmd_bias(snapshot_ref: str) -> int:
             else:
                 verdict = {"verdict": "PASS",
                            "reason": "lookahead/recursive sin sesgo + SMA exactas"}
-            gate = {**base, **verdict,
+            gate = {**base, "status": _verdict_status(verdict["verdict"]), **verdict,
                     "lookahead": {"argv": [str(a) for a in look_argv],
                                   "exit_code": look_rc, "timed_out": look_timeout,
                                   "parsed": look_parsed, "parse_error": look_error},
@@ -1310,14 +1486,14 @@ def cmd_bias(snapshot_ref: str) -> int:
                     "own_sma": own,
                     "reference": {"argv": [str(a) for a in ref_argv],
                                   "trades": ref_info.get("count"),
+                                  "analyzable": ref_info.get("analyzable"),
                                   "has_enter_cross": ref_info.get("has_enter_cross"),
                                   "has_exit_cross": ref_info.get("has_exit_cross")},
                     "finished_at": _utcnow_iso()}
             launch._atomic_create_new(gate_path, gate)
-            launch._atomic_replace(
-                manifest_path,
-                {**base, "status": "SUCCEEDED" if verdict["verdict"] == "PASS" else "FAILED",
-                 "finished_at": _utcnow_iso(), **verdict})
+            term = _verdict_status(verdict["verdict"])
+            launch._atomic_replace(manifest_path, {**base, "status": term,
+                                                   "finished_at": _utcnow_iso(), **verdict})
             print(str(gate_path))
             return 0 if verdict["verdict"] == "PASS" else 1
     except RuntimeError as exc:
