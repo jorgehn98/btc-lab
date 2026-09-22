@@ -841,6 +841,42 @@ class ResearchNativeCase(unittest.TestCase):
             self.assertEqual(summary["trades"], 6, "control: 6 trades")
 
 
+class ResearchRefCoverageCase(unittest.TestCase):
+    def test_cross_coverage_reconoce_exit_reason_sma_bear(self):
+        from operations import research
+
+        import zipfile
+
+        def _native(tmpdir, name, trades):
+            native = Path(tmpdir) / name
+            native.mkdir()
+            with zipfile.ZipFile(str(native / "r.zip"), "w") as bundle:
+                bundle.writestr("backtest-result-a.json", json.dumps(
+                    {"SmaCrossBaseline": {"profit_total_abs": 10.0, "profit_total": 0.01,
+                                          "total_trades": len(trades),
+                                          "max_drawdown_abs": 1.0, "trades": trades}}))
+            return native
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Freqtrade 2026.8 serializa el exit_tag de estrategia en exit_reason:
+            # trade real con enter_tag sma_bull y exit_reason sma_bear.
+            signal = _native(tmp, "signal", [
+                {"enter_tag": "sma_bull", "exit_reason": "sma_bear",
+                 "fee_open": 0.1, "fee_close": 0.1}])
+            info, error = research._ref_trades(signal)
+            self.assertIsNone(error, f"referencia legible: {error}")
+            self.assertTrue(info["has_enter_cross"], "enter_tag sma_bull cubre entrada")
+            self.assertTrue(info["has_exit_cross"],
+                            "exit_reason sma_bear cubre salida (tag serializado)")
+            stop = _native(tmp, "stop", [
+                {"enter_tag": "sma_bull", "exit_reason": "stop_loss",
+                 "fee_open": 0.1, "fee_close": 0.1}])
+            info, error = research._ref_trades(stop)
+            self.assertIsNone(error, f"referencia legible: {error}")
+            self.assertTrue(info["has_enter_cross"], "entrada intacta")
+            self.assertFalse(info["has_exit_cross"], "solo stop_loss no es salida por señal")
+
+
 class ResearchLookaheadCase(unittest.TestCase):
     def test_csv_sesgo_baja_cobertura_y_ausente_no_dan_pass(self):
         from operations import research

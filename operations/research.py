@@ -1052,9 +1052,9 @@ def _ref_trades(native_dir: Path) -> tuple:
         enter_tag = str(trade.get("enter_tag") or "")
         exit_tag = str(trade.get("exit_tag") or "")
         exit_reason = str(trade.get("exit_reason") or "")
-        if "bull" in enter_tag or enter_tag == "sma_bull":
+        if enter_tag == "sma_bull":
             has_enter = True
-        if "bear" in exit_tag or exit_tag == "sma_bear" or exit_reason == "exit_signal":
+        if exit_tag == "sma_bear" or exit_reason in ("sma_bear", "exit_signal"):
             has_exit = True
     return {"count": len(trades), "has_enter_cross": has_enter,
             "has_exit_cross": has_exit, "trades": trades}, None
