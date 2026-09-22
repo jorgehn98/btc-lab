@@ -1335,7 +1335,7 @@ def _output_digest(run_key: str, evidence: str, results_min: dict,
 
 
 def _verify_cached_output(prior: dict, expected_output, run_key: str,
-                          evidence: str, names) -> dict | None:
+                          evidence: str, names, search_root=None) -> dict | None:
     """Re-verifica un exito cacheado contra el ZIP autoritativo.
 
     Exige digest de salida esperado en el estado, ruta canonica contenida,
@@ -1351,7 +1351,8 @@ def _verify_cached_output(prior: dict, expected_output, run_key: str,
     if not zip_rel or not zip_sha or not payload_sha:
         return None
     try:
-        target = _contained_under(Path(CONTAINER_SEARCH), str(zip_rel), "zip cache")
+        target = _contained_under(Path(search_root or CONTAINER_SEARCH),
+                                  str(zip_rel), "zip cache")
     except ValueError:
         return None
     if not target.is_file():
@@ -1910,9 +1911,9 @@ def _load_full_1h(seg_dir_path):
 
 
 def _execute_native_matrix(*, phase, role, windows, fees, groups, snap_root,
-                           session_dir, batch_dir, state, state_path,
-                           manifest_in, code_hashes, seg_meta_by_dir,
-                           by_class_params):
+                            session_dir, batch_dir, state, state_path,
+                            manifest_in, code_hashes, seg_meta_by_dir,
+                            by_class_params, search_root=None):
     """Matriz nativa batch/single con budget/cache/progreso compartidos.
 
     groups: [{names:[...], use_list:bool, spath:str, params:dict, suffix:str}]
@@ -1922,6 +1923,7 @@ def _execute_native_matrix(*, phase, role, windows, fees, groups, snap_root,
     """
     from research.state import can_reuse_run, record_attempt
 
+    root = Path(search_root or CONTAINER_SEARCH)
     jobs = []
     for window in windows:
         for fee in fees:
@@ -1947,7 +1949,7 @@ def _execute_native_matrix(*, phase, role, windows, fees, groups, snap_root,
     results: dict = {}
 
     def _prior_batch_file(run_key, evidence):
-        for prev in sorted(Path(CONTAINER_SEARCH).joinpath("sessions").glob(f"{phase}-*/batches/*.json")):
+        for prev in sorted(root.joinpath("sessions").glob(f"{phase}-*/batches/*.json")):
             try:
                 payload = json.loads(Path(prev).read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -1991,7 +1993,7 @@ def _execute_native_matrix(*, phase, role, windows, fees, groups, snap_root,
                 expected_output = ((state.get("native_runs") or {}).get(run_key)
                                    or {}).get("output")
                 verified = _verify_cached_output(prior, expected_output,
-                                                 run_key, evidence, names)
+                                                 run_key, evidence, names, root)
                 if verified is not None:
                     batch_payload = dict(prior)
                     batch_payload["results"] = verified
@@ -2119,7 +2121,7 @@ def _execute_native_matrix(*, phase, role, windows, fees, groups, snap_root,
                                    else f"parse:{raw_err[:60]}")
                 try:
                     zip_rel = str((export_dir / zips[0].name).resolve().relative_to(
-                        Path(CONTAINER_SEARCH).resolve()))
+                        root.resolve()))
                 except ValueError:
                     raise _JobFail("output:path") from None
                 try:

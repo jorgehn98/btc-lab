@@ -7,6 +7,9 @@ un smoke `dry_run` (`NoTradeSmoke`) y un baseline experimental cerrado
 (`SmaCrossBaseline`). El baseline no es una estrategia económica validada ni
 trading real; cualquier activación depende de sus gates y de una decisión explícita.
 La campaña de 72 variantes spot terminó TRAIN sin finalistas; no activó ningún bot.
+El segundo estudio de 48 configuraciones SMA50/200 con/sin trailing tiene
+identidad y estado propios: terminó TRAIN sin preseleccionados y tampoco
+acreditó ninguna estrategia.
 El repositorio no es un fork de Freqtrade; consume su imagen oficial sin modificarla.
 
 ## Stack y estructura
@@ -28,11 +31,14 @@ El repositorio no es un fork de Freqtrade; consume su imagen oficial sin modific
 - `market/equity.py`: ledger analítico MTM de fills nativos y reconciliación.
 - `operations/search.py` y `research/`: campaña cerrada, selección y presupuesto.
 - `strategies/search/`: variantes spot y control experimental.
+- `operations/regime.py`, `research/regime*.py`, `strategies/regime/`:
+  segundo estudio preregistrado, aislado y solo TRAIN.
 - `tests/test_operations.py`: contratos de seguridad, identidad, señales y salud.
 - `docs/guides/local-lab.md`: guía única de operación y recuperación.
 - `docs/guides/baseline.md`: guía operativa de investigación y baseline.
 - `docs/guides/history.md`: guía única del histórico, snapshots y ledger.
 - `docs/guides/strategy-search.md`: protocolo y dictamen de la búsqueda cerrada.
+- `docs/guides/regime-study.md`: hipótesis, gates y operación del segundo estudio.
 - `storage/`: datos persistentes locales, fuera de Git.
 - `work/` y `.engram/`: planificación y memoria locales, fuera de Git.
 
@@ -99,6 +105,9 @@ No añadir tests de texto que solo copien el contenido de Compose o de la docume
 - VALIDATION y TEST exigen grants canónicos derivados de finalistas verificados;
   no existen en esta campaña porque SCREEN terminó sin TOP9. Los helpers de
   autorización pura no desbloquean el runtime. No descargar ni evaluar esos roles.
+- `regime-screen` solo monta TRAIN y registra un `campaign_id`, input, fuente
+  generada, sesiones y control separados de `search/`. No añadirle flags
+  libres, grants ni acceso a VALIDATION/TEST para saltarse el siguiente PR.
 - `LAB_HISTORY_INPUT` debe fijar el manifiesto único devuelto por `prepare`; no se
   permite elegir el input más reciente ni usar flags libres para abrir TEST.
 - `LAB_SMOKE_INPUT` fija ese archivo antes del primer `up`. Dentro del contenedor
@@ -128,8 +137,9 @@ permisos del socket Docker. Las units incluyen rutas del despliegue local: al
 trasladarlas a otro equipo, adaptar esas rutas y verificar con `systemd-analyze`.
 
 El servicio `smoke` es optativo (`--profile smoke`); no usar `up` genérico.
-Los servicios `baseline`, `research` e `history` son optativos (`--profile baseline`,
-`--profile research` y `--profile history`); no usar `up` genérico ni arrancarlos
+Los servicios `baseline`, `research`, `history` y `regime-screen` son optativos
+(`--profile baseline`, `--profile research`, `--profile history` y
+`--profile regime`); no usar `up` genérico ni arrancarlos
 como sustituto de los gates.
 `restart: on-failure:3` no habilita arranque al encender el equipo. El timer de
 usuario comprueba salud cada cinco minutos, sin reiniciar el bot; requiere la

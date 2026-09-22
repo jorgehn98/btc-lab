@@ -309,3 +309,58 @@ services:
         bind:
           create_host_path: false
           selinux: z
+  regime-screen:
+    <<: *engine
+    profiles: [regime]
+    entrypoint: [python, -m, operations.regime]
+    command: [--help]
+    cpus: 4.0
+    mem_limit: 8g
+    restart: "no"
+    stop_grace_period: 30s
+    volumes:
+      - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/market:/opt/btc-lab/market:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/research:/opt/btc-lab/research:ro,z
+      - type: bind
+        source: ${LAB_STORAGE_ROOT:?set absolute storage root}/regime/control
+        target: /lab-regime/control
+        bind:
+          create_host_path: false
+          selinux: z
+      - type: bind
+        source: ${LAB_STORAGE_ROOT:?set absolute storage root}/regime/sessions
+        target: /lab-regime/sessions
+        bind:
+          create_host_path: false
+          selinux: z
+      - type: bind
+        source: ${LAB_STORAGE_ROOT:?set absolute storage root}/regime/generated
+        target: /lab-regime/generated
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+      - type: bind
+        source: ${LAB_REGIME_TRAIN_SNAPSHOT:-${LAB_STORAGE_ROOT}/history/snapshots/train-snap-b6ae65f3}
+        target: /lab-regime/snapshots/train
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+      - type: bind
+        source: ${LAB_REGIME_TRAIN_MANIFEST:-${LAB_STORAGE_ROOT}/history/snapshots/train-snap-2026-09-22T114307.436903Z-b5914210-b6ae.json}
+        target: /lab-regime/snapshots/train-manifest.json
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+      - type: bind
+        source: ${LAB_REGIME_INPUT:-/nonexistent/btc-lab-regime-unprepared.json}
+        target: /lab-regime/input.json
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
