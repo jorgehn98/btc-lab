@@ -603,7 +603,13 @@ def _load_trades_file(path: Path) -> tuple:
 
 def cmd_ledger(snapshot_ref: str, segment: int, trades_ref: str,
                initial: float = 10000.0, native_profit: float | None = None) -> int:
-    """Ledger analitico sobre segmento congelado + trades nativos (sin backtest)."""
+    """Ledger analitico sobre la ventana eval del segmento (sin backtest).
+
+    Recorta el 5m del segmento a [eval_start, end) antes de construir; los
+    trades se pasan enteros para que un open en warmup falle en vez de
+    ignorarse. Crea intento RUNNING tras preflight/refs y lo finaliza a
+    SUCCEEDED/FAILED; sin profit nativo no hay prueba nativa (reconcile None).
+    """
     try:
         manifest_in = _load_input()
         _verify_current_against_input(manifest_in)
@@ -659,15 +665,9 @@ def cmd_ledger(snapshot_ref: str, segment: int, trades_ref: str,
         except ValueError as exc:
             print(f"ledger: {exc}", file=sys.stderr)
             return 2
-    try:
-        if not tpath.is_file():
-            raise FileNotFoundError(f"trades no encontrado: {trades_ref}")
-        trades, file_profit = _load_trades_file(tpath)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"ledger: {exc}", file=sys.stderr)
+    if not tpath.is_file():
+        print(f"ledger: trades no encontrado: {trades_ref}", file=sys.stderr)
         return 2
-    if native_profit is None:
-        native_profit = file_profit
     try:
         initial_f = float(initial)
     except (TypeError, ValueError):
@@ -677,38 +677,10 @@ def cmd_ledger(snapshot_ref: str, segment: int, trades_ref: str,
         with _locked():
             from datetime import datetime as _dt
 
-            seg_dir = snap_dir / str(meta.get("seg_dir"))
-            seg_5_path = seg_dir / _pair_file(PAIR, TIMEFRAME_5M)
-            if launch.file_hash(seg_5_path) != meta.get("file_5m_sha256"):
-                print("ledger: segmento alterado", file=sys.stderr)
-                return 1
-            prices = pd.read_feather(str(seg_5_path))
-            eval_start = _dt.fromisoformat(str(meta["eval_start"]).replace("Z", "+00:00"))
-            window_end = _dt.fromisoformat(str(meta["end_exclusive"]).replace("Z", "+00:00"))
-            # Ventana efectiva comun: eval (post-warmup) hasta fin de segmento.
-            curve, summary = build_ledger(prices, trades, initial_f, eval_start, window_end)
-            entry: dict = {
-                "segment": seg_idx,
-                "trades": len(trades),
-                "initial": initial_f,
-                "summary": {k: (v.isoformat() if hasattr(v, "isoformat") else v)
-                            for k, v in summary.items()},
-            }
-            if native_profit is not None:
-                try:
-                    rec = reconcile_final_ledger(summary, float(native_profit), initial_f)
-                except ValueError as exc:
-                    print(f"ledger: reconcile invalido: {exc}", file=sys.stderr)
-                    return 2
-                entry["reconcile"] = rec
-                entry["evaluation_status"] = "SUCCEEDED" if rec["ok"] else "FAILED"
-            else:
-                entry["evaluation_status"] = "SUCCEEDED"
             session_id = uuid.uuid4().hex
             manifest_path = sessions / f"ledger-{_slug()}-{session_id[:4]}.json"
-            payload = {
+            base = {
                 "kind": LEDGER_KIND,
-                "status": "SUCCEEDED" if entry["evaluation_status"] == "SUCCEEDED" else "FAILED",
                 "session_id": session_id,
                 "created_at": _utcnow_iso(),
                 "input_id": manifest_in.get("input_id"),
@@ -716,12 +688,78 @@ def cmd_ledger(snapshot_ref: str, segment: int, trades_ref: str,
                 "snapshot_manifest": str(snap_path),
                 "segment_meta": meta,
                 "trades_ref": str(tpath),
-                "result": entry,
-                "finished_at": _utcnow_iso(),
             }
-            launch._atomic_create_new(manifest_path, payload)
+            launch._atomic_create_new(manifest_path, {**base, "status": "RUNNING"})
+
+            def _fail(reason) -> int:
+                launch._atomic_replace(manifest_path, {**base, "status": "FAILED",
+                                                        "finished_at": _utcnow_iso(),
+                                                        "error": str(reason)})
+                print(f"ledger: FAILED {reason}", file=sys.stderr)
+                print(str(manifest_path))
+                return 1
+
+            try:
+                trades, file_profit = _load_trades_file(tpath)
+            except (FileNotFoundError, ValueError) as exc:
+                return _fail(exc)
+            profit = native_profit if native_profit is not None else file_profit
+            if profit is not None:
+                try:
+                    profit_f: float | None = float(profit)
+                except (TypeError, ValueError) as exc:
+                    return _fail(f"native profit no numerico: {exc}")
+            else:
+                profit_f = None
+            seg_dir = snap_dir / str(meta.get("seg_dir"))
+            seg_5_path = seg_dir / _pair_file(PAIR, TIMEFRAME_5M)
+            try:
+                if launch.file_hash(seg_5_path) != meta.get("file_5m_sha256"):
+                    raise ValueError("segmento alterado (hash)")
+                prices = pd.read_feather(str(seg_5_path))
+            except (OSError, ValueError) as exc:
+                return _fail(exc)
+            eval_start = _dt.fromisoformat(str(meta["eval_start"]).replace("Z", "+00:00"))
+            window_end = _dt.fromisoformat(str(meta["end_exclusive"]).replace("Z", "+00:00"))
+            # Ventana efectiva: recorta warmup del 5m; trades enteros para que
+            # un open en warmup falle en el ledger en vez de ignorarse.
+            try:
+                stamps = pd.to_datetime(prices["date"], utc=True)
+                mask = (stamps >= eval_start) & (stamps < window_end)
+                eval_prices = prices.loc[mask].sort_values("date").reset_index(drop=True)
+                if len(eval_prices) == 0:
+                    raise ValueError("ventana eval sin velas tras recorte warmup")
+                curve, summary = build_ledger(eval_prices, trades, initial_f,
+                                              eval_start, window_end)
+            except (ValueError, KeyError) as exc:
+                return _fail(exc)
+            entry: dict = {
+                "segment": seg_idx,
+                "trades": len(trades),
+                "initial": initial_f,
+                "summary": {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                            for k, v in summary.items()},
+            }
+            if profit_f is not None:
+                try:
+                    rec = reconcile_final_ledger(summary, profit_f, initial_f)
+                except (TypeError, ValueError) as exc:
+                    return _fail(f"reconcile invalido: {exc}")
+                entry["reconcile"] = rec
+                entry["evaluation_status"] = "SUCCEEDED" if rec["ok"] else "FAILED"
+            else:
+                # Sin prueba nativa el analisis no equivale a resultado nativo:
+                # campo separado None, sin PnL/gate inventados (PR02 exige proof).
+                entry["reconcile"] = None
+                entry["note"] = ("analisis analitico sin profit nativo: no equivale "
+                                 "a resultado nativo ni gate")
+                entry["evaluation_status"] = "SUCCEEDED"
+            status = "SUCCEEDED" if entry["evaluation_status"] == "SUCCEEDED" else "FAILED"
+            launch._atomic_replace(manifest_path, {**base, "status": status,
+                                                    "finished_at": _utcnow_iso(),
+                                                    "result": entry})
             print(str(manifest_path))
-            return 0 if entry["evaluation_status"] == "SUCCEEDED" else 1
+            return 0 if status == "SUCCEEDED" else 1
     except ValueError as exc:
         print(f"ledger: FAILED {exc}", file=sys.stderr)
         return 1

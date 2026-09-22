@@ -3,13 +3,17 @@
 Critical cases include native USDT fees, open losses, cash-only spot accounting
 without margin, 5m gaps, and a terminal event exactly at the exclusive end.
 """
+import json
 import math
 import sys
+import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
 
 try:
     import pandas as pd
@@ -430,6 +434,189 @@ class TimeWeightedCase(unittest.TestCase):
         with self.assertRaises(ValueError, msg="anos distintos no se intersectan"):
             median_excess_by_year({2019: 0.01, 2020: 0.02},
                                   {2019: 0.005, 2020: 0.015, 2021: 0.02})
+
+
+HIST_COMMIT = "9f3a1c2d4e5b6a7890abcdef1234567890abcde1"
+
+
+class HistoryLedgerCase(unittest.TestCase):
+    """cmd_ledger real sobre snapshot TRAIN eligible (203h: 201 warmup + 2 eval).
+
+    Bug PR01: leia el segmento completo y lo pasaba con ventana eval, por lo
+    que todo elegible fallaba. Ademas los fallos no persistian intento FAILED.
+    Loader de snapshot, hashes, bounds de rol y cmd_ledger son reales; solo
+    el preflight (_load_input/_verify) se dirige a tmp via constantes.
+    """
+
+    SEG_START = datetime(2021, 6, 1, 0, 0, tzinfo=UTC)
+    N_1H = 203  # >= 201+1 eligible; eval = ultimas 2h (24 filas 5m)
+
+    def _tree(self, tmp):
+        _require_pandas(self)
+        import pandas as pd
+
+        from operations import history as H
+        from operations import launch
+
+        res = Path(tmp) / "hist"
+        snaps = res / "snapshots"
+        snap_dir = snaps / "train-snap-eval"
+        seg_dir = snap_dir / "seg00"
+        seg_dir.mkdir(parents=True)
+        n1, n5 = self.N_1H, self.N_1H * 12
+        idx1 = pd.date_range(start=self.SEG_START, periods=n1, freq="1h", tz="UTC")
+        f1 = pd.DataFrame({
+            "date": idx1,
+            "open": [100.0] * n1,
+            "high": [100.5] * n1,
+            "low": [99.5] * n1,
+            "close": [100.0] * n1,
+            "volume": [10.0] * n1,
+        })
+        idx5 = pd.date_range(start=self.SEG_START, periods=n5, freq="5min", tz="UTC")
+        f5 = pd.DataFrame({
+            "date": idx5,
+            "open": [100.0] * n5,
+            "high": [100.5] * n5,
+            "low": [99.5] * n5,
+            "close": [100.0] * n5,
+            "volume": [10.0] * n5,
+        })
+        whole_5m = snap_dir / H._pair_file(H.PAIR, H.TIMEFRAME_5M)
+        whole_1h = snap_dir / H._pair_file(H.PAIR, H.TIMEFRAME_1H)
+        seg_5 = seg_dir / H._pair_file(H.PAIR, H.TIMEFRAME_5M)
+        seg_1 = seg_dir / H._pair_file(H.PAIR, H.TIMEFRAME_1H)
+        f5.to_feather(str(whole_5m))
+        f1.to_feather(str(whole_1h))
+        f5.to_feather(str(seg_5))
+        f1.to_feather(str(seg_1))
+        eval_start = self.SEG_START + timedelta(hours=201)
+        end_excl = self.SEG_START + timedelta(hours=n1)
+        meta = {
+            "index": 0,
+            "length": n1,
+            "start": self.SEG_START.isoformat(),
+            "end_last": (end_excl - timedelta(hours=1)).isoformat(),
+            "end_exclusive": end_excl.isoformat(),
+            "eval_start": eval_start.isoformat(),
+            "eligible": True,
+            "seg_dir": "seg00",
+            "file_5m_sha256": launch.file_hash(seg_5),
+            "file_1h_sha256": launch.file_hash(seg_1),
+        }
+        (snaps / "train-snap-eval.json").write_text(json.dumps({
+            "kind": H.SNAPSHOT_KIND, "status": "FROZEN",
+            "snapshot_id": "eval", "snapshot_dir": snap_dir.name,
+            "role": "train",
+            "whole_5m_sha256": launch.file_hash(whole_5m),
+            "whole_1h_sha256": launch.file_hash(whole_1h),
+            "segments_meta": [meta],
+        }), encoding="utf-8")
+        rstart, rend = H._role_bounds("train")
+        input_path = Path(tmp) / "input.json"
+        input_path.write_text(json.dumps({
+            "kind": H.INPUT_KIND, "status": "PREPARED",
+            "image_ref": launch.PINNED_IMAGE, "commit": HIST_COMMIT,
+            "input_id": "in1", "role": "train",
+            "range_start": rstart.isoformat(), "range_end": rend.isoformat(),
+            **H._code_hashes(ROOT),
+        }), encoding="utf-8")
+        return res, input_path, meta
+
+    def _eval_trade(self, meta, **over):
+        from datetime import datetime as _dt
+
+        estart = _dt.fromisoformat(str(meta["eval_start"]).replace("Z", "+00:00"))
+        base = {
+            "amount": 1.0,
+            "open_rate": 100.0,
+            "close_rate": 100.0,
+            "fee_open": 0.001,
+            "fee_close": 0.001,
+            "open_date": estart.isoformat(),
+            "close_date": (estart + timedelta(hours=1)).isoformat(),
+        }
+        base.update(over)
+        return base
+
+    def _write_trades(self, res, name, payload):
+        sessions = res / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / name).write_text(json.dumps(payload), encoding="utf-8")
+        return name
+
+    def _patched(self, H, res, input_path):
+        return (
+            mock.patch.object(H, "CONTAINER_HISTORY", str(res)),
+            mock.patch.object(H, "CONTAINER_INPUT", str(input_path)),
+            mock.patch.object(H, "CONTAINER_CODE", str(ROOT)),
+        )
+
+    def test_cmd_ledger_trims_warmup_uses_eval_window(self):
+        _require_pandas(self)
+        from operations import history as H
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res, input_path, meta = self._tree(tmp)
+            trade = self._eval_trade(meta)
+            # PnL nativo: 1x(100->100) pierde 0.2 en fees.
+            self._write_trades(res, "trades.json",
+                               {"trades": [trade], "profit_total_abs": -0.2})
+            p1, p2, p3 = self._patched(H, res, input_path)
+            with p1, p2, p3:
+                rc = H.cmd_ledger("train-snap-eval.json", 0, "trades.json",
+                                  10000.0, -0.2)
+            self.assertEqual(rc, 0, "elegible con trades solo-eval debe SUCCESS")
+            manifests = list((res / "sessions").glob("ledger-*.json"))
+            self.assertEqual(len(manifests), 1, f"un intento: {manifests}")
+            payload = json.loads(manifests[0].read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "SUCCEEDED", payload)
+            summary = payload["result"]["summary"]
+            # Ventana efectiva eval, no segmento completo con warmup.
+            self.assertEqual(summary["window_start"], meta["eval_start"])
+            self.assertEqual(summary["window_end"], meta["end_exclusive"])
+            self.assertAlmostEqual(summary["days_observed"], 2 / 24, delta=1e-9)
+            self.assertEqual(payload["result"]["trades"], 1)
+            self.assertTrue(payload["result"]["reconcile"]["ok"], payload)
+
+    def test_cmd_ledger_persists_failed_attempt(self):
+        _require_pandas(self)
+        from operations import history as H
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res, input_path, meta = self._tree(tmp)
+            # Trade en warmup (fuera de la ventana eval) y profit erroneo.
+            bad = self._eval_trade(
+                meta,
+                open_date=self.SEG_START.isoformat(),
+                close_date=(self.SEG_START + timedelta(hours=1)).isoformat(),
+            )
+            self._write_trades(res, "trades-bad.json", [bad])
+            ok_trade = self._eval_trade(meta)
+            self._write_trades(res, "trades-ok.json",
+                               {"trades": [ok_trade], "profit_total_abs": -0.2})
+            p1, p2, p3 = self._patched(H, res, input_path)
+            with p1, p2, p3:
+                rc_bad = H.cmd_ledger("train-snap-eval.json", 0, "trades-bad.json",
+                                      10000.0, None)
+            self.assertNotEqual(rc_bad, 0, "trade fuera de eval no es exito")
+            failed = list((res / "sessions").glob("ledger-*.json"))
+            self.assertEqual(len(failed), 1, f"intento FAILED persistente: {failed}")
+            self.assertEqual(json.loads(failed[0].read_text(encoding="utf-8"))["status"],
+                             "FAILED")
+            with p1, p2, p3:
+                rc_wrong = H.cmd_ledger("train-snap-eval.json", 0, "trades-ok.json",
+                                        10000.0, 999.0)
+            self.assertNotEqual(rc_wrong, 0, "reconcile erroneo no es exito")
+            failed = sorted((res / "sessions").glob("ledger-*.json"))
+            self.assertEqual(len(failed), 2, f"segundo FAILED persistente: {failed}")
+            # Preflight denegado: sin intento nuevo.
+            with mock.patch.object(H, "_load_input", side_effect=ValueError("denied")), \
+                    mock.patch.object(H, "CONTAINER_HISTORY", str(res)):
+                rc_denied = H.cmd_ledger("train-snap-eval.json", 0, "trades-ok.json",
+                                         10000.0, None)
+            self.assertEqual(rc_denied, 2, "input denegado no crea intento")
+            self.assertEqual(len(list((res / "sessions").glob("ledger-*.json"))), 2)
 
 
 if __name__ == "__main__":
