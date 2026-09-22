@@ -21,7 +21,9 @@ x-engine: &engine
   tmpfs:
     - /tmp:rw,nosuid,nodev,size=256m
   volumes:
-    - ${LAB_CODE_ROOT:?set absolute code root}:/opt/btc-lab:ro,z
+    - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+    - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+    - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
     - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs:/lab-storage/runs:rw,z
     - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs/inputs:/lab-storage/runs/inputs:ro,z
   logging:
@@ -47,7 +49,9 @@ services:
     restart: "on-failure:3"
     stop_grace_period: 30s
     volumes:
-      - ${LAB_CODE_ROOT:?set absolute code root}:/opt/btc-lab:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs:/lab-storage/runs:rw,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs/inputs:/lab-storage/runs/inputs:ro,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/runtime/smoke:/freqtrade/user_data:rw,z

@@ -5,7 +5,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 TimeoutStartSec=30
-ExecStart=/usr/bin/python3 "/home/jorgextech/dev/personal/Crypto Trading Bot/worktrees/btc-lab-foundation/operations/health.py" "--container" "btc-lab-smoke-1" "--logfile" "/home/jorgextech/dev/personal/Crypto Trading Bot/storage/runtime/smoke/freqtrade.log" "--output" "/home/jorgextech/dev/personal/Crypto Trading Bot/storage/health.json" "--lock" "/home/jorgextech/dev/personal/Crypto Trading Bot/storage/health.lock"
+ExecStart=/usr/bin/python3 "/home/jorgextech/dev/personal/Crypto Trading Bot/operations/health.py" "--container" "btc-lab-smoke-1" "--logfile" "/home/jorgextech/dev/personal/Crypto Trading Bot/storage/runtime/smoke/freqtrade.log" "--output" "/home/jorgextech/dev/personal/Crypto Trading Bot/storage/health.json" "--lock" "/home/jorgextech/dev/personal/Crypto Trading Bot/storage/health.lock"
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=true
