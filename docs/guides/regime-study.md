@@ -1,6 +1,7 @@
 # Estudio cerrado de reentrada y régimen
 
-Esta es una campaña **nueva**, exclusivamente de investigación en TRAIN.
+Esta fue una segunda campaña **independiente**, exclusivamente de investigación
+en TRAIN. Su resultado fue `SUCCEEDED / NO_CANDIDATE`.
 La búsqueda anterior de 72 variantes terminó sin finalistas y sus datos,
 input, estado, presupuesto y código sellado no se reabren. Ningún resultado
 de este estudio activa un bot por sí solo.
@@ -52,11 +53,40 @@ de ~20 % anual requiere evidencia adicional sobre capital persistente.
 El motor Freqtrade 2026.8 a veces exporta `force_exit` fechado antes de
 una entrada en la última vela 1h cuando se usa detalle 5m. El ledger rechaza
 ese año como inconcluso; **no** se cambian fecha ni precio de los fills.
-Hay como máximo tres **preseleccionados económicos**, uno por perfil; no son
+Se permitían como máximo tres **preseleccionados económicos**, uno por perfil;
+no eran
 finalistas ni autorizan VALIDATION/TEST. Una entrega condicional posterior
 debe completar stress y chequeos técnicos en TRAIN sin reemplazos antes de
 conceder cualquier grant. Este PR solo tiene servicio TRAIN. Sin
 preseleccionados, se comunica NO_CANDIDATE.
+
+## Resultado de TRAIN
+
+SCREEN completó **540/540 lotes nativos sin fallos**, en 30 ventanas TRAIN,
+con 3.213,61 segundos de cómputo nativo y 150,34 segundos adicionales de
+agregación. El informe contiene 576 registros anuales: ninguna variante
+superó todos los gates y `preliminary_ids` quedó vacío. El código de salida
+1 comunica ese veredicto terminal, no un fallo de los backtests.
+
+Las 24 variantes con reentrada tuvieron un año 2017 inconcluso debido a
+fills `force_exit` temporalmente invertidos de la imagen oficial. No se les
+atribuye una pérdida ni se corrigen sus operaciones. Las otras 24 variantes
+con años evaluables tuvieron **menos de 100 operaciones no forzadas** en
+2019–2022; ninguna alcanzó 0,05 % diario neto, ni por tiempo observado ni
+normalizado a calendario. El mejor valor calendario fue R002, la regla
+SMA50/200 original con riesgo alto, stop 2 % y **sin trailing**:
+0,01145 % diario sintético sobre los 1.461 días y 0,01325 % en días
+observados. Tuvo 83 operaciones, 2/4 años positivos y DD TRAIN 6,50 %;
+el buy-and-hold comparable registró 0,02249 % diario calendario.
+
+Con la misma entrada y riesgo, R005 con trailing registró -0,00030 % diario
+calendario y DD 3,65 %: limitó caídas pero recortó también beneficio.
+De 12 parejas comparables con ambos años evaluables, trailing mejoró la tasa
+calendario en tres y redujo el drawdown en las doce. Las 12 parejas restantes
+no permiten esa comparación porque sus variantes con reentrada quedaron
+inconclusas. No hay finalistas, grants ni acceso a VALIDATION/TEST, y
+no se activó ningún bot. No usar el objetivo de 0,05 % para cambiar
+retroactivamente el umbral ni proclamar un 20 % anual real.
 
 ## Ejecución local
 
@@ -92,7 +122,7 @@ estudio. El estado y los reportes quedan en `storage/regime/` fuera de Git.
 Un proceso detenido no implica éxito: comprobar el estado terminal en el
 reporte de la sesión y `status` antes de concluir o reanudar.
 
-La campaña aún no tiene resultado económico. Los tests de contratos se
+Los tests de contratos se
 ejecutan en el host (con skips de pandas/Freqtrade) y la imagen fijada; la
 comparación nativa batch/individual, que requiere consultar metadatos
 públicos de Binance, se ejecuta aparte en el perfil de investigación.

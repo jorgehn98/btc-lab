@@ -7,8 +7,9 @@ un smoke `dry_run` (`NoTradeSmoke`) y un baseline experimental cerrado
 (`SmaCrossBaseline`). El baseline no es una estrategia económica validada ni
 trading real; cualquier activación depende de sus gates y de una decisión explícita.
 La campaña de 72 variantes spot terminó TRAIN sin finalistas; no activó ningún bot.
-El estudio siguiente de 48 configuraciones SMA50/200 con/sin trailing tiene identidad y estado
-propios y únicamente ejecuta TRAIN; aún no acredita ninguna estrategia.
+El segundo estudio de 48 configuraciones SMA50/200 con/sin trailing tiene
+identidad y estado propios: terminó TRAIN sin preseleccionados y tampoco
+acreditó ninguna estrategia.
 El repositorio no es un fork de Freqtrade; consume su imagen oficial sin modificarla.
 
 ## Stack y estructura
