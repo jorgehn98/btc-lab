@@ -1,7 +1,8 @@
 # Baseline experimental BTC/USDT
 
-Esta guía opera el perfil cerrado `baseline` y su investigación TRAIN. No activa
-trading real ni convierte `SmaCrossBaseline` en una estrategia validada. Los datos
+Esta guía describe el perfil cerrado `baseline` y su operación protegida. El perfil
+está pausado mientras la campaña del histórico avanza; esta guía no lo activa por
+sí sola. No activa trading real ni convierte `SmaCrossBaseline` en una estrategia validada. Los datos
 descargados, snapshots, sesiones, logs y métricas son artefactos locales: no se
 publican ni se usan para afirmar rentabilidad privada.
 
@@ -22,9 +23,9 @@ el capital disponible inicial es `9.900 USDT` y el cap teórico es aproximadamen
 Si faltan saldo, precio o datos válidos, o el mínimo del exchange supera el cap,
 se rechaza la entrada. La reserva del cap es conservadora y no estima slippage.
 
-## TRAIN y metodología
+## TRAIN legacy y metodología
 
-TRAIN es únicamente BTC/USDT spot de Binance público, `5m`, en el intervalo UTC
+El TRAIN de este perfil legacy es únicamente BTC/USDT spot de Binance público, `5m`, en el intervalo UTC
 semiabierto `[2018-01-01, 2023-01-01)`. No se descargan VALIDATION, TEST ni la
 reserva 2026. La conversión a `1h` usa solo grupos completos de 12 velas de `5m`
 alineadas; no rellena velas. Los segmentos horarios contiguos se evalúan por
@@ -117,7 +118,7 @@ Un gate terminado nunca debe quedar en `RUNNING`: su estado terminal es `PASS`,
 `INCONCLUSIVE`, respectivamente. No copies datos a Git ni presentes una sesión en
 curso como `PASS`.
 
-### Resumen TRAIN disponible
+### Evidencia legacy disponible
 
 El snapshot local contiene `524.293` velas de `5m`, `43.679` velas de `1h` y
 30 segmentos, de los que 27 son elegibles. Se ejecutaron 108 backtests: 8 no
@@ -141,7 +142,8 @@ publica CSV, DB ni logs completos.
 ## Baseline dry-run aislado
 
 El perfil baseline es una excepción cerrada al perfil técnico smoke, no una
-selección genérica. Prepara un input nuevo después de revisar los gates:
+selección genérica. La preparación de un input no equivale a autorización de
+arranque; además de los gates se requiere una decisión explícita:
 
 ```sh
 baseline_input="$(python3 -m operations.launch prepare-baseline \
@@ -156,9 +158,10 @@ docker compose --profile baseline up -d baseline
 Usa `SmaCrossBaseline`, una DB `tradesv3.baseline.dryrun.sqlite` y logs propios
 en `runtime/baseline`. Mantiene UID/GID `1000:1000`, rootfs de solo lectura,
 sin capacidades, API, Telegram, credenciales ni puertos; limita el servicio a
-1 CPU y 2 GiB. El baseline está activado como experimento `dry_run`; el smoke y
-su timer deben permanecer detenidos mientras baseline sea el perfil activo. El
-baseline espera señales del mercado y no fuerza trades para demostrar actividad.
+1 CPU y 2 GiB. El baseline solo se considerará activado después de una decisión
+explícita y de verificar su input, mounts y salud. Mientras la investigación esté
+en curso, permanece detenido y su timer no se habilita. El baseline espera señales
+del mercado y no fuerza trades para demostrar actividad.
 
 ```sh
 python3 -m operations.health --container btc-lab-baseline-1 \
@@ -168,8 +171,8 @@ python3 -m operations.health --container btc-lab-baseline-1 \
 ```
 
 El timer propio es `operations/systemd/btc-lab-baseline-health.timer`, una
-comprobación oneshot cada cinco minutos y es el timer activo del baseline.
-Habilítalo solo después de revisar estado, journal y JSON de salud:
+comprobación oneshot cada cinco minutos. Solo se habilita si el baseline fue
+autorizado explícitamente y después de revisar estado, journal y JSON de salud:
 
 ```sh
 systemctl --user link "$LAB_CODE_ROOT/operations/systemd/btc-lab-baseline-health.service" \
@@ -205,8 +208,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now btc-lab-health.timer
 ```
 
-Si el rollback mantiene baseline como perfil activo, enlaza sus units y habilita
-su timer en lugar del timer smoke:
+Si una decisión explícita mantiene baseline como perfil activo tras un rollback,
+enlaza sus units y habilita su timer en lugar del timer smoke:
 
 ```sh
 systemctl --user link "$LAB_CODE_ROOT/operations/systemd/btc-lab-baseline-health.service" \

@@ -22,9 +22,13 @@ El repositorio no es un fork de Freqtrade; consume su imagen oficial sin modific
 - `strategies/smoke/NoTradeSmoke.py`: estrategia técnica sin entradas.
 - `strategies/baseline/SmaCrossBaseline.py`: cruce SMA20/50 experimental, solo largo.
 - `operations/research.py` y `market/train.py`: descarga, snapshot y evaluación TRAIN.
+- `operations/history.py` y `market/history.py`: histórico por roles y contrato
+  fail-closed de TRAIN/VALIDATION/TEST.
+- `market/equity.py`: ledger analítico MTM de fills nativos y reconciliación.
 - `tests/test_operations.py`: contratos de seguridad, identidad, señales y salud.
 - `docs/guides/local-lab.md`: guía única de operación y recuperación.
 - `docs/guides/baseline.md`: guía operativa de investigación y baseline.
+- `docs/guides/history.md`: guía única del histórico, snapshots y ledger.
 - `storage/`: datos persistentes locales, fuera de Git.
 - `work/` y `.engram/`: planificación y memoria locales, fuera de Git.
 
@@ -85,6 +89,14 @@ No añadir tests de texto que solo copien el contenido de Compose o de la docume
 - `prepare-smoke` y `prepare-baseline` corren en el host: exigen árbol Git limpio,
   imagen disponible y hashes de los módulos del perfil. Devuelven un archivo único;
   no usar alias mutable ni seleccionar el input más reciente.
+- `operations.history prepare` corre en el host y solo prepara TRAIN en PR01:
+  Binance público BTC/USDT spot `5m`, `[2017-08-17T04:00Z, 2023-01-01T00:00Z)`.
+  `download`, `snapshot` y `ledger` corren en contenedores y no montan Git.
+- VALIDATION y TEST permanecen fail-closed hasta que PR02 implemente y verifique
+  sus artefactos de fase. Los helpers de autorización pura no desbloquean el
+  runtime. No descargar ni evaluar roles externos durante PR01.
+- `LAB_HISTORY_INPUT` debe fijar el manifiesto único devuelto por `prepare`; no se
+  permite elegir el input más reciente ni usar flags libres para abrir TEST.
 - `LAB_SMOKE_INPUT` fija ese archivo antes del primer `up`. Dentro del contenedor
   se monta en `/lab-storage/active-input.json` RO con `create_host_path: false`.
   El subdirectorio `runs/inputs/` también es RO sobre `runs/` RW.
@@ -93,6 +105,8 @@ No añadir tests de texto que solo copien el contenido de Compose o de la docume
 - `baseline` es la excepción cerrada a la regla de solo smoke: usa únicamente
   `SmaCrossBaseline`, `configs/baseline.json`, sus módulos TRAIN y su DB propia.
   No abrir una selección genérica de estrategias, configuraciones, raíces o parámetros.
+  El baseline y sus timers están pausados mientras se investiga; no se presenta
+  como activo ni se activa por la existencia de resultados históricos.
 - Reanudar un input congelado no autoriza a modificar los archivos que identifica.
   Una versión nueva requiere nuevo preflight; nunca ajustar hashes para ocultar cambios.
 - Docker monta solo `operations/`, `configs/`, `strategies/` y `market/` como código RO.
@@ -109,8 +123,9 @@ permisos del socket Docker. Las units incluyen rutas del despliegue local: al
 trasladarlas a otro equipo, adaptar esas rutas y verificar con `systemd-analyze`.
 
 El servicio `smoke` es optativo (`--profile smoke`); no usar `up` genérico.
-Los servicios `baseline` y `research` son optativos (`--profile baseline` y
-`--profile research`); no usar `up` genérico ni arrancarlos como sustituto de los gates.
+Los servicios `baseline`, `research` e `history` son optativos (`--profile baseline`,
+`--profile research` y `--profile history`); no usar `up` genérico ni arrancarlos
+como sustituto de los gates.
 `restart: on-failure:3` no habilita arranque al encender el equipo. El timer de
 usuario comprueba salud cada cinco minutos, sin reiniciar el bot; requiere la
 sesión de usuario y el PC disponibles. No cambiar linger, suspensión o servicios
@@ -121,7 +136,8 @@ un proceso existente o un dato ausente no prueba salud. Mantener lock, timeouts
 y códigos de salida de fallo. Propagar SIGTERM/SIGINT al hijo; marcar CANCELLED
 solo al observar la señal. Un manifiesto RUNNING tras una caída no es éxito.
 
-El baseline mantiene una posición long simulada como estado persistente. Antes de
+El baseline mantiene una posición long simulada como estado persistente cuando se
+activa explícitamente. Antes de
 cambiar código hasheado se detienen el smoke y su timer; después del cambio se
 prepara un input nuevo. Al activar baseline se mantiene smoke detenido y se usa su
 timer propio. Un rollback requiere input nuevo tras cambios de código y verificación

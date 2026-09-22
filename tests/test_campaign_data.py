@@ -1,37 +1,8 @@
-"""T01 — particiones por rol y ledger mark-to-market (RED).
+"""Tests for UTC partitions and the mark-to-market ledger.
 
-Seams (implementer PR01, misma raiz/rama, sin worktrees):
-- market/history.py: partition_bounds(role) -> (start, end) UTC semiabierto.
-  Roles exactos: "train", "validation", "test". Sin fechas configurables
-  ni flags de bypass.
-- market/history.py: authorize_partition(role, selection) -> dict con
-  start/end autorizados y seleccion normalizada. TRAIN sin holdouts,
-  VALIDATION 1-3 finalistas, TEST 1 candidata con consumo unico.
-- market/equity.py: build_ledger(prices_5m, trades, initial_balance,
-  window_start, window_end) -> (curve, summary). Contabilidad analitica
-  long spot sin DCA/margen, MTM en velas 5m cerradas, reconciliacion
-  nativa tol 0.01 USDT.
-- market/equity.py: buyhold_comparable(...), time_weighted_g(...),
-  median_excess_by_year(...). Benchmark comparable y metricas
-  ponderadas por tiempo/ano, no por episodios.
-
-Literales independientes (no copiar el 1039.58 inconsistente):
-amount 2 entry 100 fee .001 -> cash 799.8; precio 80 -> equity 959.8
-DD 40.2 USDT / 0.0402; salida 110 fee .001 -> final 1019.58, fees 0.42.
-La perdida abierta debe verse aunque el cierre sea beneficio.
-
-Bugs del primer GREEN (coordinador, DD15%): pct debe ser max pct
-(1000->840 =16% manda sobre 2000->1800 =10% abs 200); cierre EXACTO
-en end liquida caja final y curva terminal sin vela futura; fills
-fuera de grid 5m y cobertura incompleta rechazan; is_short True/1
-rechaza aunque falte side; solape max1 rechaza pero close+open mismo
-ts acepta en cualquier orden y open==close misma vela es valido;
-mediana exige mismos anos, sin interseccion silenciosa.
-
-Run host (sin pandas): stdlib corre (particiones + metricas puras),
-pandas salta. Run runtime fijado: imagen con pandas/numpy, sin red.
+Critical cases include native USDT fees, open losses, cash-only spot accounting
+without margin, 5m gaps, and a terminal event exactly at the exclusive end.
 """
-
 import math
 import sys
 import unittest
@@ -142,9 +113,9 @@ class PartitionBoundsCase(unittest.TestCase):
                     partition_bounds(bad)
         # Sin fechas configurables ni bypass: solo un arg posicional.
         with self.assertRaises(TypeError):
-            partition_bounds("train", TRAIN_START)  # type: ignore[arg-type]
+            partition_bounds("train", TRAIN_START)
         with self.assertRaises((ValueError, TypeError)):
-            partition_bounds("train", force=True)  # type: ignore[call-arg]
+            partition_bounds("train", force=True)
 
 
 class AuthorizePartitionCase(unittest.TestCase):
@@ -271,8 +242,6 @@ class LedgerCase(unittest.TestCase):
         build_ledger = self._ledger()
         start = datetime(2021, 6, 1, 0, 0, tzinfo=UTC)
         end = datetime(2021, 6, 1, 0, 20, tzinfo=UTC)
-        # Fees 0 para aislar la curva exacta: 800+2*precio.
-        # 100->1000, 20->840, 600->2000, 500->1800 (fees+terminal en otro test).
         prices = _make_prices("2021-06-01 00:00", [100.0, 20.0, 600.0, 500.0])
         trade = _trade(start, end, close_rate=500.0, fee_open=0.0, fee_close=0.0)
         _, summary = build_ledger(prices, [trade], 1000.0, start, end)
@@ -364,7 +333,6 @@ class LedgerCase(unittest.TestCase):
                 # margen: solo close-primero es valido en ambos ordenes.
                 curve, summary = build_ledger(prices, ordered, 150.0,
                                               self.WINDOW_START, self.WINDOW_END)
-                # 2 trades 1x(100->100): 150-100.1+99.9-100.1+99.9 = 149.6.
                 self.assertAlmostEqual(summary["final_cash"], 149.6, delta=0.02)
                 self.assertLessEqual(float(curve["quantity"].max()), 1.0 + 1e-9,
                                      "max1: close antes que open")
@@ -377,7 +345,6 @@ class LedgerCase(unittest.TestCase):
                         amount=1.0, open_rate=100.0, close_rate=90.0)
         _, summary = build_ledger(prices, [t_same], 1000.0,
                                   self.WINDOW_START, self.WINDOW_END)
-        # Coste 100.1, proceeds 89.91 -> final 989.81.
         self.assertAlmostEqual(summary["final_cash"], 989.81, delta=0.02)
 
     def test_sampling_prices_within_end_ordered(self):
@@ -418,11 +385,9 @@ class BenchmarkCase(unittest.TestCase):
     def test_comparable_uses_same_profile_from_9900(self):
         from market.equity import buyhold_comparable
 
-        # Bajo 2%: min(990, 12.375/0.026) = 475.9615... literal.
         bajo = buyhold_comparable(100.0, 100.0, 9900.0, 0.00125, 0.10, 0.02, 0.001)
         self.assertAlmostEqual(bajo["notional"], 475.9615385, delta=1e-4)
         self.assertAlmostEqual(bajo["pnl"], -0.9519231, delta=1e-4)
-        # Medio 2%: 951.9231, distinto del Bajo con mismo precio.
         medio = buyhold_comparable(100.0, 100.0, 9900.0, 0.0025, 0.20, 0.02, 0.001)
         self.assertAlmostEqual(medio["notional"], 951.9230769, delta=1e-4)
         self.assertAlmostEqual(medio["pnl"], -1.9038462, delta=1e-4)
@@ -433,7 +398,6 @@ class BenchmarkCase(unittest.TestCase):
         from market.equity import buyhold_comparable
 
         got = buyhold_comparable(100.0, 110.0, 9900.0, 0.0025, 0.20, 0.02, 0.001)
-        # 9.5192*110*0.999 - 951.9231*1.001 = 93.1932... literal.
         self.assertAlmostEqual(got["pnl"], 93.1932692, delta=1e-4)
         self.assertIn("exposure", got, "exposicion marcada")
         self.assertAlmostEqual(float(got["exposure"]), 0.20, delta=1e-9)
@@ -448,9 +412,7 @@ class TimeWeightedCase(unittest.TestCase):
             {"equity_initial": 1000.0, "equity_final": 990.0, "days": 2.0},
         ]
         got = time_weighted_g(episodes)
-        # (ln1.01958 + ln0.99) / 3 = 0.0031134... literal.
         self.assertAlmostEqual(got, 0.00311348, delta=1e-6)
-        # Promedio por episodios (0.00718...) no vale.
         self.assertGreater(abs(got - 0.00718280), 0.002, "pondera por dias")
 
     def test_median_excess_per_year_not_per_episode(self):
@@ -458,7 +420,6 @@ class TimeWeightedCase(unittest.TestCase):
 
         cand = {2019: 0.01, 2020: 0.02, 2021: 0.03}
         bench = {2019: 0.005, 2020: 0.015, 2021: 0.02}
-        # Excesos [0.005, 0.005, 0.01] -> mediana 0.005, media 0.0066.
         got = median_excess_by_year(cand, bench)
         self.assertAlmostEqual(got, 0.005, delta=1e-9)
         self.assertLess(got, (0.005 + 0.005 + 0.01) / 3, "mediana, no media")
