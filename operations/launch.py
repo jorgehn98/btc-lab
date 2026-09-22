@@ -44,7 +44,19 @@ STRATEGY_REL = Path("strategies/smoke/NoTradeSmoke.py")
 STRATEGY_DIR_REL = Path("strategies/smoke")
 INPUTS_SUBDIR = Path("runs/inputs")
 CONTAINER_ACTIVE_INPUT = "/lab-storage/active-input.json"
+CONTAINER_ACTIVE_BASELINE_INPUT = "/lab-storage/active-baseline-input.json"
 RUNS_SUBDIR = Path("runs")
+
+BASELINE_STRATEGY_NAME = "SmaCrossBaseline"
+BASELINE_CONFIG_REL = Path("configs/baseline.json")
+BASELINE_STRATEGY_REL = Path("strategies/baseline/SmaCrossBaseline.py")
+BASELINE_STRATEGY_DIR_REL = Path("strategies/baseline")
+BASELINE_MARKET_REL = Path("market/train.py")
+BASELINE_RESEARCH_REL = Path("operations/research.py")
+BASELINE_INPUT_KIND = "btc-lab-baseline-input"
+BASELINE_RUN_KIND = "btc-lab-baseline-run"
+BASELINE_PROFILE = "baseline"
+BASELINE_DB_FILENAME = "tradesv3.baseline.dryrun.sqlite"
 
 TOP_REQUIRED = frozenset({
     "exchange", "pairlists", "trading_mode", "dry_run", "dry_run_wallet",
@@ -56,6 +68,12 @@ TOP_REQUIRED = frozenset({
 TOP_ALLOWED = TOP_REQUIRED | {"entry_pricing", "exit_pricing", "initial_state", "internals"}
 PRICING_PIN = {
     "price_side": "same",
+    "use_order_book": False,
+    "order_book_top": 1,
+    "price_last_balance": 0.0,
+}
+BASELINE_PRICING_PIN = {
+    "price_side": "other",
     "use_order_book": False,
     "order_book_top": 1,
     "price_last_balance": 0.0,
@@ -91,8 +109,8 @@ DOCKER_TIMEOUT_S = 60
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
 
-def validate_config(config: dict, environ) -> None:
-    """Acepta solo la config canónica BTC spot dry-run; ValueError si no."""
+def _validate_common(config: dict, environ) -> None:
+    """Checks compartidos smoke/baseline; ValueError si no."""
     for key in environ:
         if key.startswith("FREQTRADE__"):
             raise ValueError(f"override de entorno no permitido: {key}")
@@ -104,9 +122,6 @@ def validate_config(config: dict, environ) -> None:
     missing = TOP_REQUIRED - set(config)
     if missing:
         raise ValueError(f"claves obligatorias ausentes: {sorted(missing)}")
-    for pricing in ("entry_pricing", "exit_pricing"):
-        if pricing in config and config[pricing] != PRICING_PIN:
-            raise ValueError(f"{pricing} debe ser exactamente {PRICING_PIN}")
     if "initial_state" in config and config["initial_state"] != INITIAL_STATE_PIN:
         raise ValueError(f"initial_state debe ser {INITIAL_STATE_PIN}")
     if "internals" in config and config["internals"] != INTERNALS_PIN:
@@ -142,16 +157,24 @@ def validate_config(config: dict, environ) -> None:
         raise ValueError("stake_amount debe ser 1000")
     if config["max_open_trades"] != 1:
         raise ValueError("max_open_trades debe ser 1")
-    if config["timeframe"] != "5m":
-        raise ValueError("timeframe debe ser 5m")
-    if config["strategy"] != STRATEGY_NAME:
-        raise ValueError(f"strategy debe ser {STRATEGY_NAME}")
     if config["api_server"] not in (_SERVICE_FIXTURE, API_PIN):
         raise ValueError("api_server debe estar desactivado con valores fijados")
     if config["telegram"] not in (_SERVICE_FIXTURE, TELEGRAM_PIN):
         raise ValueError("telegram debe estar desactivado con valores fijados")
     if config["fee"] != 0.001:
         raise ValueError("fee debe ser 0.001")
+
+
+def validate_config(config: dict, environ) -> None:
+    """Acepta solo la config canónica BTC spot dry-run; ValueError si no."""
+    _validate_common(config, environ)
+    for pricing in ("entry_pricing", "exit_pricing"):
+        if pricing in config and config[pricing] != PRICING_PIN:
+            raise ValueError(f"{pricing} debe ser exactamente {PRICING_PIN}")
+    if config["timeframe"] != "5m":
+        raise ValueError("timeframe debe ser 5m")
+    if config["strategy"] != STRATEGY_NAME:
+        raise ValueError(f"strategy debe ser {STRATEGY_NAME}")
 
 
 def file_hash(path) -> str:
@@ -180,6 +203,32 @@ def container_command() -> list:
     ]
 
 
+def baseline_command() -> list:
+    """Argv cerrado del baseline (DB propia, sin reutilizar la de smoke)."""
+    userdir = CONTAINER_USERDATA
+    return [
+        "freqtrade", "trade",
+        "--config", f"{CONTAINER_CODE}/{BASELINE_CONFIG_REL.as_posix()}",
+        "--strategy", BASELINE_STRATEGY_NAME,
+        "--strategy-path", f"{CONTAINER_CODE}/{BASELINE_STRATEGY_DIR_REL.as_posix()}",
+        "--userdir", userdir,
+        "--db-url", "sqlite:///" + userdir + "/" + BASELINE_DB_FILENAME,
+        "--logfile", userdir + "/freqtrade.log",
+    ]
+
+
+def validate_baseline_config(config: dict, environ) -> None:
+    """Acepta solo la config canónica baseline BTC spot 1h dry-run."""
+    _validate_common(config, environ)
+    for pricing in ("entry_pricing", "exit_pricing"):
+        if pricing in config and config[pricing] != BASELINE_PRICING_PIN:
+            raise ValueError(f"{pricing} debe ser exactamente {BASELINE_PRICING_PIN}")
+    if config["timeframe"] != "1h":
+        raise ValueError("timeframe debe ser 1h")
+    if config["strategy"] != BASELINE_STRATEGY_NAME:
+        raise ValueError(f"strategy debe ser {BASELINE_STRATEGY_NAME}")
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -195,9 +244,52 @@ def _load_config(code_root: Path) -> tuple[dict, Path]:
     return config, cfg_path
 
 
+def _load_baseline_config(code_root: Path) -> tuple[dict, Path]:
+    cfg_path = code_root / BASELINE_CONFIG_REL
+    try:
+        config = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"config baseline ilegible: {cfg_path}: {exc}") from exc
+    return config, cfg_path
+
+
 def _module_hash(filename: str) -> str:
     """SHA256 del módulo propio; sin fallback: si falta, FileNotFoundError."""
     return file_hash(Path(__file__).with_name(filename))
+
+
+# Políticas cerradas inmutables: solo dos perfiles, sin kwargs genéricos.
+# Cada política fija kind/profile/db/strategy/config y hashes exigidos.
+# Solo datos; el dispatch llama a los wrappers públicos por nombre para
+# preservar mocks (p. ej. container_command) en tests.
+_SMOKE_POLICY = {
+    "profile": "smoke",
+    "kind": "btc-lab-smoke-input",
+    "run_kind": "btc-lab-smoke-run",
+    "strategy": STRATEGY_NAME,
+    "config_rel": CONFIG_REL,
+    "strategy_rel": STRATEGY_REL,
+    "extra_rels": (),
+    "input_prefix": "input-",
+    "run_prefix": "run-",
+}
+_BASELINE_POLICY = {
+    "profile": "baseline",
+    "kind": BASELINE_INPUT_KIND,
+    "run_kind": BASELINE_RUN_KIND,
+    "strategy": BASELINE_STRATEGY_NAME,
+    "config_rel": BASELINE_CONFIG_REL,
+    "strategy_rel": BASELINE_STRATEGY_REL,
+    "extra_rels": (BASELINE_MARKET_REL, BASELINE_RESEARCH_REL),
+    "input_prefix": "baseline-input-",
+    "run_prefix": "baseline-run-",
+}
+_POLICIES = {
+    "smoke": _SMOKE_POLICY,
+    "baseline": _BASELINE_POLICY,
+}
 
 
 def _git_commit(code_root: Path) -> str:
@@ -295,8 +387,11 @@ def _validate_real_schema(config: dict) -> None:
         raise ValueError(f"schema Freqtrade rechaza la config: {exc}") from exc
 
 
-def prepare_smoke(code_root, storage_root, image_ref) -> str:
-    """Preflight host: verifica identidad y publica el input congelado."""
+def _prepare(profile, code_root, storage_root, image_ref) -> str:
+    """Preflight host común; `profile` solo "smoke"|"baseline"."""
+    if profile not in _POLICIES:
+        raise ValueError(f"perfil desconocido: {profile!r}")
+    policy = _POLICIES[profile]
     if not isinstance(image_ref, str) or image_ref.strip() != PINNED_IMAGE:
         raise ValueError("image_ref debe ser exactamente la imagen fijada con digest")
     code = Path(code_root)
@@ -304,18 +399,34 @@ def prepare_smoke(code_root, storage_root, image_ref) -> str:
     if not code.is_dir():
         raise FileNotFoundError(f"código no encontrado: {code}")
 
-    config, cfg_path = _load_config(code)
-    strat_path = code / STRATEGY_REL
+    if profile == "smoke":
+        config, cfg_path = _load_config(code)
+    else:
+        config, cfg_path = _load_baseline_config(code)
+    strat_path = code / policy["strategy_rel"]
     if not strat_path.is_file():
         raise FileNotFoundError(f"estrategia no encontrada: {strat_path}")
-    validate_config(config, os.environ)
+    extra_paths = []
+    for rel in policy["extra_rels"]:
+        target = code / rel
+        if not target.is_file():
+            raise FileNotFoundError(f"módulo exigido no encontrado: {target}")
+        extra_paths.append(target)
+    if profile == "smoke":
+        validate_config(config, os.environ)
+    else:
+        validate_baseline_config(config, os.environ)
 
     commit = _git_commit(code)
     _git_clean(code)
     image_id = _inspect_image(image_ref.strip())
 
+    if profile == "smoke":
+        expected_command = container_command()
+    else:
+        expected_command = baseline_command()
     manifest = {
-        "kind": "btc-lab-smoke-input",
+        "kind": policy["kind"],
         "status": "PREPARED",
         "input_id": uuid.uuid4().hex,
         "created_at": _utcnow_iso(),
@@ -323,18 +434,27 @@ def prepare_smoke(code_root, storage_root, image_ref) -> str:
         "image_ref": image_ref.strip(),
         "image_id": image_id,
         "image_digest": PINNED_IMAGE,
-        "strategy": STRATEGY_NAME,
-        "config_path": f"{CONTAINER_CODE}/{CONFIG_REL.as_posix()}",
+        "strategy": policy["strategy"],
+        "config_path": f"{CONTAINER_CODE}/{policy['config_rel'].as_posix()}",
         "config_hash": file_hash(cfg_path),
         "strategy_hash": file_hash(strat_path),
         "launch_hash": _module_hash("launch.py"),
         "health_hash": _module_hash("health.py"),
-        "expected_command": container_command(),
+        "expected_command": expected_command,
     }
-    name = f"input-{manifest['created_at'].replace(':', '').replace('+', '')}-{manifest['input_id'][:8]}.json"
+    if profile == "baseline":
+        manifest["profile"] = _BASELINE_POLICY["profile"]
+        manifest["market_hash"] = file_hash(code / BASELINE_MARKET_REL)
+        manifest["research_hash"] = file_hash(code / BASELINE_RESEARCH_REL)
+    name = f"{policy['input_prefix']}{manifest['created_at'].replace(':', '').replace('+', '')}-{manifest['input_id'][:8]}.json"
     out = store / INPUTS_SUBDIR / name
     _atomic_create_new(out, manifest)
     return str(out)
+
+
+def prepare_smoke(code_root, storage_root, image_ref) -> str:
+    """Preflight host: verifica identidad y publica el input congelado."""
+    return _prepare("smoke", code_root, storage_root, image_ref)
 
 
 def _run_forwarded(argv: list, env: dict) -> tuple:
@@ -391,66 +511,7 @@ def _check_input_manifest(manifest_in: dict) -> None:
         raise ValueError("manifiesto de entrada sin input_id")
 
 
-def run_smoke(code_root, storage_root, input_path) -> int:
-    """Revalida identidad contra el input y ejecuta; manifiesto propio atómico.
-
-    CANCELLED solo si el launcher recibe SIGTERM/SIGINT y la reenvía (con
-    el exit original); un 130 espontáneo o un auto-SIGTERM del hijo sin
-    señal al padre es FAILED.
-    """
-    code, store = _require_container_roots(code_root, storage_root)
-    try:
-        manifest_in = json.loads(Path(input_path).read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"manifiesto de entrada ilegible: {exc}") from exc
-    _check_input_manifest(manifest_in)
-
-    config, _ = _load_config(code)
-    validate_config(config, os.environ)
-    strat_path = code / STRATEGY_REL
-    if file_hash(code / CONFIG_REL) != manifest_in.get("config_hash"):
-        raise ValueError("config alterada tras prepare: hashes no coinciden")
-    if file_hash(strat_path) != manifest_in.get("strategy_hash"):
-        raise ValueError("estrategia alterada tras prepare: hashes no coinciden")
-    for label, filename in (("launch", "launch.py"), ("health", "health.py")):
-        expected = manifest_in.get(f"{label}_hash")
-        if not expected or _module_hash(filename) != expected:
-            raise ValueError(f"{filename} alterado tras prepare: hash no coincide")
-    _validate_real_schema(config)
-
-    command = container_command()
-    if manifest_in.get("expected_command") != command:
-        raise ValueError("comando esperado no coincide con el manifiesto de entrada")
-
-    run_id = uuid.uuid4().hex
-    started_at = _utcnow_iso()
-    run_path = store / RUNS_SUBDIR / f"run-{started_at.replace(':', '').replace('+', '')}-{run_id[:8]}.json"
-    base = {
-        "kind": "btc-lab-smoke-run",
-        "run_id": run_id,
-        "input_id": manifest_in.get("input_id"),
-        "created_at": started_at,
-        "commit": manifest_in.get("commit"),
-        "image_ref": manifest_in.get("image_ref"),
-        "image_id": manifest_in.get("image_id"),
-        "config_hash": manifest_in.get("config_hash"),
-        "strategy_hash": manifest_in.get("strategy_hash"),
-        "command": command,
-        "logfile": f"{CONTAINER_USERDATA}/freqtrade.log",
-    }
-    _atomic_create_new(run_path, {**base, "status": "RUNNING", "exit_code": None})
-
-    child_env = {k: v for k, v in os.environ.items() if not k.startswith("FREQTRADE__")}
-    try:
-        returncode, signum = _run_forwarded(command, child_env)
-    except Exception as exc:
-        _atomic_replace(run_path, {
-            **base, "status": "FAILED", "exit_code": None,
-            "finished_at": _utcnow_iso(), "error": f"{type(exc).__name__}: {exc}",
-        })
-        raise
+def _finish_child(run_path: Path, base: dict, returncode, signum) -> int:
     if signum is not None:
         try:
             signame = signal.Signals(signum).name
@@ -468,6 +529,124 @@ def run_smoke(code_root, storage_root, input_path) -> int:
     return returncode
 
 
+def _run(profile, code_root, storage_root, input_path) -> int:
+    """Ejecución común; `profile` solo "smoke"|"baseline".
+
+    CANCELLED solo si el launcher recibe SIGTERM/SIGINT y la reenvía (con
+    el exit original); un 130 espontáneo o un auto-SIGTERM del hijo sin
+    señal al padre es FAILED.
+    """
+    if profile not in _POLICIES:
+        raise ValueError(f"perfil desconocido: {profile!r}")
+    policy = _POLICIES[profile]
+    code, store = _require_container_roots(code_root, storage_root)
+    try:
+        manifest_in = json.loads(Path(input_path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError) as exc:
+        label = "baseline" if profile == "baseline" else "entrada"
+        raise ValueError(f"manifiesto {label} ilegible: {exc}") from exc
+    if profile == "smoke":
+        _check_input_manifest(manifest_in)
+    else:
+        _check_baseline_input_manifest(manifest_in)
+
+    if profile == "smoke":
+        config, _ = _load_config(code)
+        validate_config(config, os.environ)
+    else:
+        config, _ = _load_baseline_config(code)
+        validate_baseline_config(config, os.environ)
+    strat_path = code / policy["strategy_rel"]
+    if file_hash(code / policy["config_rel"]) != manifest_in.get("config_hash"):
+        raise ValueError("config alterada tras prepare: hashes no coinciden")
+    if file_hash(strat_path) != manifest_in.get("strategy_hash"):
+        raise ValueError("estrategia alterada tras prepare: hashes no coinciden")
+    if profile == "baseline":
+        if file_hash(code / BASELINE_MARKET_REL) != manifest_in.get("market_hash"):
+            raise ValueError("market/train.py alterado tras prepare: hash no coincide")
+        if file_hash(code / BASELINE_RESEARCH_REL) != manifest_in.get("research_hash"):
+            raise ValueError("operations/research.py alterado tras prepare: hash no coincide")
+    for label, filename in (("launch", "launch.py"), ("health", "health.py")):
+        expected = manifest_in.get(f"{label}_hash")
+        if not expected or _module_hash(filename) != expected:
+            raise ValueError(f"{filename} alterado tras prepare: hash no coincide")
+    _validate_real_schema(config)
+
+    if profile == "smoke":
+        command = container_command()
+    else:
+        command = baseline_command()
+    if manifest_in.get("expected_command") != command:
+        raise ValueError("comando esperado no coincide con el manifiesto de entrada")
+
+    run_id = uuid.uuid4().hex
+    started_at = _utcnow_iso()
+    run_path = store / RUNS_SUBDIR / f"{policy['run_prefix']}{started_at.replace(':', '').replace('+', '')}-{run_id[:8]}.json"
+    base = {
+        "kind": policy["run_kind"],
+        "run_id": run_id,
+        "input_id": manifest_in.get("input_id"),
+        "created_at": started_at,
+        "commit": manifest_in.get("commit"),
+        "image_ref": manifest_in.get("image_ref"),
+        "image_id": manifest_in.get("image_id"),
+        "config_hash": manifest_in.get("config_hash"),
+        "strategy_hash": manifest_in.get("strategy_hash"),
+        "command": command,
+        "logfile": f"{CONTAINER_USERDATA}/freqtrade.log",
+    }
+    if profile == "baseline":
+        base["profile"] = _BASELINE_POLICY["profile"]
+        base["market_hash"] = manifest_in.get("market_hash")
+        base["research_hash"] = manifest_in.get("research_hash")
+    _atomic_create_new(run_path, {**base, "status": "RUNNING", "exit_code": None})
+
+    child_env = {k: v for k, v in os.environ.items() if not k.startswith("FREQTRADE__")}
+    try:
+        returncode, signum = _run_forwarded(command, child_env)
+    except Exception as exc:
+        _atomic_replace(run_path, {
+            **base, "status": "FAILED", "exit_code": None,
+            "finished_at": _utcnow_iso(), "error": f"{type(exc).__name__}: {exc}",
+        })
+        raise
+    return _finish_child(run_path, base, returncode, signum)
+
+
+def run_smoke(code_root, storage_root, input_path) -> int:
+    """Revalida identidad contra el input y ejecuta; manifiesto propio atómico."""
+    return _run("smoke", code_root, storage_root, input_path)
+
+
+def _check_baseline_input_manifest(manifest_in: dict) -> None:
+    if not isinstance(manifest_in, dict):
+        raise ValueError("manifiesto baseline ilegible: no es un objeto")
+    if manifest_in.get("kind") != BASELINE_INPUT_KIND:
+        raise ValueError("manifiesto baseline con kind inesperado")
+    if manifest_in.get("profile") != BASELINE_PROFILE:
+        raise ValueError("manifiesto baseline con profile inesperado")
+    if manifest_in.get("status") != "PREPARED":
+        raise ValueError("manifiesto baseline no está PREPARED")
+    if manifest_in.get("image_ref") != PINNED_IMAGE:
+        raise ValueError("manifiesto baseline sin imagen fijada")
+    if not _COMMIT_RE.fullmatch(str(manifest_in.get("commit") or "")):
+        raise ValueError("manifiesto baseline sin commit válido")
+    if not manifest_in.get("input_id"):
+        raise ValueError("manifiesto baseline sin input_id")
+
+
+def prepare_baseline(code_root, storage_root, image_ref) -> str:
+    """Preflight host baseline: identidad cerrada y manifiesto único inmutable."""
+    return _prepare("baseline", code_root, storage_root, image_ref)
+
+
+def run_baseline(code_root, storage_root, input_path) -> int:
+    """Revalida identidad baseline contra el input y ejecuta; manifiesto propio."""
+    return _run("baseline", code_root, storage_root, input_path)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="operations.launch")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -481,6 +660,14 @@ def main(argv=None) -> int:
     smoke = sub.add_parser("smoke", help="ejecuta el smoke (en contenedor)")
     smoke.add_argument("--input", default=os.environ.get("SMOKE_INPUT", CONTAINER_ACTIVE_INPUT))
 
+    prep_base = sub.add_parser("prepare-baseline", help="preflight host baseline + manifiesto")
+    prep_base.add_argument("--code-root", default=os.environ.get("LAB_CODE_ROOT", ""))
+    prep_base.add_argument("--storage-root", default=os.environ.get("LAB_STORAGE_ROOT", ""))
+    prep_base.add_argument("--image", default=PINNED_IMAGE)
+
+    baseline = sub.add_parser("baseline", help="ejecuta el baseline (en contenedor)")
+    baseline.add_argument("--input", default=os.environ.get("BASELINE_INPUT", CONTAINER_ACTIVE_BASELINE_INPUT))
+
     args = parser.parse_args(argv)
     if args.command == "version":
         proc = subprocess.run(["freqtrade", "--version"])
@@ -492,6 +679,25 @@ def main(argv=None) -> int:
             return 2
         print(prepare_smoke(args.code_root, args.storage_root, args.image))
         return 0
+    if args.command == "prepare-baseline":
+        if not args.code_root or not args.storage_root:
+            print("prepare-baseline exige --code-root y --storage-root (o LAB_CODE_ROOT/LAB_STORAGE_ROOT)",
+                  file=sys.stderr)
+            return 2
+        print(prepare_baseline(args.code_root, args.storage_root, args.image))
+        return 0
+    if args.command == "smoke":
+        if not args.input:
+            print("smoke exige --input con el manifiesto congelado (o SMOKE_INPUT)", file=sys.stderr)
+            return 2
+        return run_smoke(CONTAINER_CODE, CONTAINER_STORAGE, args.input)
+    if args.command == "baseline":
+        if not args.input:
+            print("baseline exige --input con el manifiesto congelado (o BASELINE_INPUT)", file=sys.stderr)
+            return 2
+        return run_baseline(CONTAINER_CODE, CONTAINER_STORAGE, args.input)
+    # Compat: `smoke` sin subcomando explícito ya cubierto arriba; cualquier
+    # otro valor llega aquí solo si argparse lo permite en el futuro.
     if not args.input:
         print("smoke exige --input con el manifiesto congelado (o SMOKE_INPUT)", file=sys.stderr)
         return 2

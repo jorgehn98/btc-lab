@@ -24,6 +24,7 @@ x-engine: &engine
     - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
     - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
     - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+    - ${LAB_CODE_ROOT:?set absolute code root}/market:/opt/btc-lab/market:ro,z
     - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs:/lab-storage/runs:rw,z
     - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs/inputs:/lab-storage/runs/inputs:ro,z
   logging:
@@ -52,12 +53,84 @@ services:
       - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
       - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
       - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/market:/opt/btc-lab/market:ro,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs:/lab-storage/runs:rw,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs/inputs:/lab-storage/runs/inputs:ro,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/runtime/smoke:/freqtrade/user_data:rw,z
       - type: bind
         source: ${LAB_SMOKE_INPUT:-/nonexistent/btc-lab-unprepared.json}
         target: /lab-storage/active-input.json
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+  baseline:
+    <<: *engine
+    profiles: [baseline]
+    command: [baseline]
+    cpus: 1.0
+    mem_limit: 2g
+    restart: "on-failure:3"
+    stop_grace_period: 30s
+    volumes:
+      - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/market:/opt/btc-lab/market:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs:/lab-storage/runs:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/runs/inputs:/lab-storage/runs/inputs:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/runtime/baseline:/freqtrade/user_data:rw,z
+      - type: bind
+        source: ${LAB_BASELINE_INPUT:-/nonexistent/btc-lab-baseline-unprepared.json}
+        target: /lab-storage/active-baseline-input.json
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+  research-data:
+    <<: *engine
+    profiles: [research]
+    entrypoint: [python, -m, operations.research]
+    command: [--help]
+    cpus: 4.0
+    mem_limit: 8g
+    restart: "no"
+    stop_grace_period: 30s
+    volumes:
+      - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/market:/opt/btc-lab/market:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/research/downloads:/lab-research/downloads:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/research/snapshots:/lab-research/snapshots:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/research/control:/lab-research/control:rw,z
+      - type: bind
+        source: ${LAB_RESEARCH_INPUT:-/nonexistent/btc-lab-research-unprepared.json}
+        target: /lab-research/input.json
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+  research:
+    <<: *engine
+    profiles: [research]
+    entrypoint: [python, -m, operations.research]
+    command: [--help]
+    cpus: 4.0
+    mem_limit: 8g
+    restart: "no"
+    stop_grace_period: 30s
+    volumes:
+      - ${LAB_CODE_ROOT:?set absolute code root}/operations:/opt/btc-lab/operations:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/configs:/opt/btc-lab/configs:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/strategies:/opt/btc-lab/strategies:ro,z
+      - ${LAB_CODE_ROOT:?set absolute code root}/market:/opt/btc-lab/market:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/research/snapshots:/lab-research/snapshots:ro,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/research/sessions:/lab-research/sessions:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/research/control:/lab-research/control:rw,z
+      - type: bind
+        source: ${LAB_RESEARCH_INPUT:-/nonexistent/btc-lab-research-unprepared.json}
+        target: /lab-research/input.json
         read_only: true
         bind:
           create_host_path: false

@@ -1,10 +1,10 @@
 # Guía del laboratorio local
 
-Esta guía opera el smoke de la [base BTC lab](../../README.md#objetivo). Ejecuta los comandos desde una shell de la raíz del proyecto, que es el árbol de trabajo Git, y conserva las rutas absolutas: el espacio de `Crypto Trading Bot` debe ir entre comillas.
+Esta guía opera el smoke de la [base BTC lab](../../README.md#objetivo). El baseline tiene una [guía separada](baseline.md) para no mezclar sus datos, DB, input y timer con el smoke. Ejecuta los comandos desde una shell de la raíz del proyecto, que es el árbol de trabajo Git, y conserva las rutas absolutas: el espacio de `Crypto Trading Bot` debe ir entre comillas.
 
 ## Límites de esta fase
 
-El único proceso operativo es `NoTradeSmoke` sobre BTC/USDT spot en `dry_run`, con `5m`, sin credenciales, API ni Telegram. La estrategia devuelve siempre señales de entrada y salida a cero y bloquea cualquier entrada; no es rentable por diseño, no es un forward test y no produce evidencia económica. No se deben calcular métricas de retorno con sus cero trades.
+Esta guía cubre el proceso `NoTradeSmoke` sobre BTC/USDT spot en `dry_run`, con `5m`, sin credenciales, API ni Telegram. La estrategia devuelve siempre señales de entrada y salida a cero y bloquea cualquier entrada; no es rentable por diseño, no es un forward test y no produce evidencia económica. No se deben calcular métricas de retorno con sus cero trades. El baseline experimental activo se opera únicamente mediante [su guía separada](baseline.md).
 
 El objetivo del proyecto es reunir evidencia reproducible para rechazar estrategias después de costes y riesgo. El siguiente estudio usa solo `TRAIN` (2018–2022 en UTC); no adelanta `VALIDATION` ni el `TEST` sellado. No se publica ningún adjunto privado.
 
@@ -179,7 +179,7 @@ La restauración solo se verifica en `verify-tradesv3.dryrun.sqlite`, una ruta n
 
 ## Timer de usuario y límites de disponibilidad
 
-Las units versionadas son `operations/systemd/btc-lab-health.service` y `.timer`: una comprobación oneshot cada cinco minutos, `TimeoutStartSec=30`, journald y sin restart automático. Ya están enlazadas desde `~/.config/systemd/user`; el grupo `docker` efectivo para systemd está verificado y `Linger=no`. No se debe habilitar linger, cambiar suspensión ni convertirlo en un servicio global. Sin linger, el timer solo funciona mientras la sesión de usuario y el PC estén disponibles.
+Las units versionadas son `operations/systemd/btc-lab-health.service` y `.timer`: una comprobación oneshot cada cinco minutos, `TimeoutStartSec=30`, journald y sin restart automático. El timer smoke debe permanecer desactivado mientras baseline sea el perfil activo; antes de reactivarlo, vuelve a enlazar las units desde `~/.config/systemd/user`. El grupo `docker` efectivo para systemd está verificado y `Linger=no`. No se debe habilitar linger, cambiar suspensión ni convertirlo en un servicio global. Sin linger, el timer solo funciona mientras la sesión de usuario y el PC estén disponibles.
 
 Activa el timer solo como operación explícita y considera la activación confirmada únicamente después de revisar `status`, journal y el JSON de health:
 
@@ -195,11 +195,23 @@ journalctl --user -u btc-lab-health.service --since "10 minutes ago" --no-pager
 test -f "$LAB_STORAGE_ROOT/health.json" && python3 -m json.tool "$LAB_STORAGE_ROOT/health.json"
 ```
 
-Para desinstalarlo de forma reversible, desactiva el timer de usuario y conserva los ficheros versionados:
+Para detenerlo de forma reversible antes de activar baseline o cambiar módulos,
+desactiva el timer de usuario y conserva los ficheros versionados:
 
 ```sh
 systemctl --user disable --now btc-lab-health.timer
 systemctl --user reset-failed btc-lab-health.service
+```
+
+`disable --now` puede retirar los enlaces de las units. Antes de volver a
+habilitar el smoke, vuelve a enlazar las plantillas, recarga systemd y ejecuta
+`enable --now`:
+
+```sh
+systemctl --user link "$LAB_CODE_ROOT/operations/systemd/btc-lab-health.service" \
+  "$LAB_CODE_ROOT/operations/systemd/btc-lab-health.timer"
+systemctl --user daemon-reload
+systemctl --user enable --now btc-lab-health.timer
 ```
 
 ## Estado de Git

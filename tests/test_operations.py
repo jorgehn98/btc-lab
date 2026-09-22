@@ -368,6 +368,12 @@ class LaunchCase(unittest.TestCase):
                     launch.run_smoke(c, s, manifest_in)
                 self.assertFalse(popen.called, label)
 
+    def test_run_roots_antes_de_leer_input(self):
+        with mock.patch.object(Path, "read_text",
+                               side_effect=AssertionError("no debe leer sin roots")):
+            with self.assertRaises(ValueError, msg="roots invalidos primero"):
+                launch.run_smoke("/invalid/code", "/invalid/store", "/invalid/input.json")
+
     def test_exit130_espontaneo_es_failed(self):
         rc, payload = _real_smoke([sys.executable, "-c", "import sys; sys.exit(130)"])
         self.assertEqual(rc, 130)

@@ -2,9 +2,10 @@
 
 ## Alcance
 
-Laboratorio propio de BTC/USDT spot con Freqtrade en Docker. La entrega actual
-es un smoke `dry_run`: `NoTradeSmoke` nunca abre operaciones. No hay una
-estrategia económica validada, trading real ni estudio histórico implementado.
+Laboratorio propio de BTC/USDT spot con Freqtrade en Docker. La entrega contiene
+un smoke `dry_run` (`NoTradeSmoke`) y un baseline experimental cerrado
+(`SmaCrossBaseline`). El baseline no es una estrategia económica validada ni
+trading real; cualquier activación depende de sus gates y de una decisión explícita.
 El repositorio no es un fork de Freqtrade; consume su imagen oficial sin modificarla.
 
 ## Stack y estructura
@@ -17,9 +18,13 @@ El repositorio no es un fork de Freqtrade; consume su imagen oficial sin modific
 - `operations/health.py`: estado Docker, heartbeat, disco, lock y salida JSON.
 - `operations/systemd/`: plantillas del monitor de usuario.
 - `configs/smoke.json`: configuración pública cerrada del smoke.
+- `configs/baseline.json`: configuración pública cerrada del baseline `1h`.
 - `strategies/smoke/NoTradeSmoke.py`: estrategia técnica sin entradas.
+- `strategies/baseline/SmaCrossBaseline.py`: cruce SMA20/50 experimental, solo largo.
+- `operations/research.py` y `market/train.py`: descarga, snapshot y evaluación TRAIN.
 - `tests/test_operations.py`: contratos de seguridad, identidad, señales y salud.
 - `docs/guides/local-lab.md`: guía única de operación y recuperación.
+- `docs/guides/baseline.md`: guía operativa de investigación y baseline.
 - `storage/`: datos persistentes locales, fuera de Git.
 - `work/` y `.engram/`: planificación y memoria locales, fuera de Git.
 
@@ -77,18 +82,22 @@ No añadir tests de texto que solo copien el contenido de Compose o de la docume
   es un placeholder público requerido por el schema, no una credencial utilizable.
 - No habilitar live, short, futuros, leverage, otras estrategias ni overrides
   `FREQTRADE__*`. No cambiar la imagen fijada silenciosamente por `stable/latest`.
-- `prepare-smoke` corre en el host: exige árbol Git limpio, imagen disponible y
-  hashes de configuración, estrategia, launcher y monitor. Devuelve un archivo
-  único; no usar alias mutable ni seleccionar el input más reciente.
+- `prepare-smoke` y `prepare-baseline` corren en el host: exigen árbol Git limpio,
+  imagen disponible y hashes de los módulos del perfil. Devuelven un archivo único;
+  no usar alias mutable ni seleccionar el input más reciente.
 - `LAB_SMOKE_INPUT` fija ese archivo antes del primer `up`. Dentro del contenedor
   se monta en `/lab-storage/active-input.json` RO con `create_host_path: false`.
   El subdirectorio `runs/inputs/` también es RO sobre `runs/` RW.
 - `smoke` usa raíces internas constantes; no acepta flags ni variables para
   redirigirlas. Cada arranque revalida los hashes y crea un manifiesto nuevo.
+- `baseline` es la excepción cerrada a la regla de solo smoke: usa únicamente
+  `SmaCrossBaseline`, `configs/baseline.json`, sus módulos TRAIN y su DB propia.
+  No abrir una selección genérica de estrategias, configuraciones, raíces o parámetros.
 - Reanudar un input congelado no autoriza a modificar los archivos que identifica.
   Una versión nueva requiere nuevo preflight; nunca ajustar hashes para ocultar cambios.
-- Docker monta solo `operations/`, `configs/` y `strategies/` como código RO.
-  No montar la raíz con Git/memoria/storage ni el socket Docker en el contenedor.
+- Docker monta solo `operations/`, `configs/`, `strategies/` y `market/` como código RO.
+  Research monta además únicamente los directorios de datos que necesita; nunca la
+  raíz con Git/memoria/storage completo ni el socket Docker en el contenedor.
 - Conservar UID/GID 1000:1000, rootfs RO, capabilities eliminadas,
   `no-new-privileges`, límites de CPU/RAM/hilos y rotación de logs.
 
@@ -100,6 +109,8 @@ permisos del socket Docker. Las units incluyen rutas del despliegue local: al
 trasladarlas a otro equipo, adaptar esas rutas y verificar con `systemd-analyze`.
 
 El servicio `smoke` es optativo (`--profile smoke`); no usar `up` genérico.
+Los servicios `baseline` y `research` son optativos (`--profile baseline` y
+`--profile research`); no usar `up` genérico ni arrancarlos como sustituto de los gates.
 `restart: on-failure:3` no habilita arranque al encender el equipo. El timer de
 usuario comprueba salud cada cinco minutos, sin reiniciar el bot; requiere la
 sesión de usuario y el PC disponibles. No cambiar linger, suspensión o servicios
@@ -109,6 +120,12 @@ globales sin autorización. Los comandos completos están en la guía operativa.
 un proceso existente o un dato ausente no prueba salud. Mantener lock, timeouts
 y códigos de salida de fallo. Propagar SIGTERM/SIGINT al hijo; marcar CANCELLED
 solo al observar la señal. Un manifiesto RUNNING tras una caída no es éxito.
+
+El baseline mantiene una posición long simulada como estado persistente. Antes de
+cambiar código hasheado se detienen el smoke y su timer; después del cambio se
+prepara un input nuevo. Al activar baseline se mantiene smoke detenido y se usa su
+timer propio. Un rollback requiere input nuevo tras cambios de código y verificación
+de montajes después de cambiar de rama. Una parada no se presenta como una venta.
 
 Conservar DB, logs y manifiestos en `storage/` al recrear contenedores. Usar la
 API de backup SQLite y verificar la restauración; no copiar una DB abierta a
