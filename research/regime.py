@@ -1,4 +1,4 @@
-"""Closed 24-cell SMA50/200 regime study, independent from the first campaign."""
+"""Closed 48-cell SMA50/200 regime study, independent from the first campaign."""
 
 import copy
 
@@ -17,20 +17,21 @@ def _make_variants():
     for reentry in (False, True):
         for slope in (False, True):
             for early_exit in (False, True):
-                for risk_profile, risk_pct, exposure in _RISK_ORDER:
-                    index = len(variants)
-                    variants.append({
-                        "id": f"R{index:03d}",
-                        "class_name": f"RegimeCandidateR{index:03d}",
-                        "family": "trend",
-                        "risk_profile": risk_profile,
-                        "risk_pct": risk_pct,
-                        "exposure": exposure,
-                        "stop": STOP,
-                        "params": {"fast": 50, "slow": 200,
-                                   "reentry": reentry, "slope": slope,
-                                   "early_exit": early_exit},
-                    })
+                for trailing in (False, True):
+                    for risk_profile, risk_pct, exposure in _RISK_ORDER:
+                        index = len(variants)
+                        variants.append({
+                            "id": f"R{index:03d}",
+                            "class_name": f"RegimeCandidateR{index:03d}",
+                            "family": "trend",
+                            "risk_profile": risk_profile,
+                            "risk_pct": risk_pct,
+                            "exposure": exposure,
+                            "stop": STOP,
+                            "params": {"fast": 50, "slow": 200,
+                                       "reentry": reentry, "slope": slope,
+                                       "early_exit": early_exit, "trailing": trailing},
+                        })
     return variants
 
 
@@ -48,7 +49,7 @@ def neighbors(variant_id):
     except KeyError:
         raise KeyError(f"variante desconocida: {variant_id!r}") from None
     params = current["params"]
-    toggles = ("reentry", "slope", "early_exit")
+    toggles = ("reentry", "slope", "early_exit", "trailing")
     return sorted(other["id"] for other in _REGISTRY
                   if other["risk_profile"] == current["risk_profile"]
                   and sum(other["params"][flag] != params[flag]
@@ -58,7 +59,7 @@ def neighbors(variant_id):
 def render_strategy_module(variants=None):
     regs = generate_variants() if variants is None else list(variants)
     if regs != _REGISTRY:
-        raise ValueError("renderer solo acepta las 24 variantes preregistradas")
+        raise ValueError("renderer solo acepta las 48 variantes preregistradas")
     lines = [
         '"""Generated fixed SMA50/200 study; no runtime parameters."""',
         "from strategies.regime.SpotRegime import RegimeSpotBase",
@@ -74,6 +75,13 @@ def render_strategy_module(variants=None):
             f'    _REENTRY = {variant["params"]["reentry"]!r}',
             f'    _SLOPE_FILTER = {variant["params"]["slope"]!r}',
             f'    _EARLY_EXIT = {variant["params"]["early_exit"]!r}',
+            f'    _TRAIL = {variant["params"]["trailing"]!r}',
+            f'    trailing_stop = {variant["params"]["trailing"]!r}',
+            *([
+                '    trailing_stop_positive = 0.01',
+                '    trailing_stop_positive_offset = 0.02',
+                '    trailing_only_offset_is_reached = True',
+            ] if variant["params"]["trailing"] else []),
             "",
         ))
     return "\n".join(lines) + "\n"

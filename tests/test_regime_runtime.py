@@ -53,6 +53,8 @@ class RegimePrepareCase(unittest.TestCase):
             self.assertEqual(gen.read_text(encoding="utf-8"), "old source\n")
             self.assertEqual(json.loads(input_path.read_text(encoding="utf-8"))["campaign_id"],
                              "btc-spot-regime-study-pr01")
+            definition = json.loads(input_path.read_text(encoding="utf-8"))["definition"]
+            self.assertEqual(definition["target"]["calendar_days"], 1461)
             self.assertEqual(json.loads(next((store / "regime/control").glob("campaign-*.json"))
                                         .read_text(encoding="utf-8"))["consumed"], 0)
 
@@ -119,7 +121,7 @@ class RegimeScreenCase(unittest.TestCase):
             seg = data_root / "seg00"
             seg.mkdir(parents=True)
             prices = ([100.0] * 200 + [90.0] * 50 + [150.0] * 20
-                      + [110.0, 151.0] + [140.0] * 80)
+                      + [155.0, 157.0, 156.0, 154.0, 145.0] + [140.0] * 80)
             idx1 = pd.date_range("2020-01-01", periods=len(prices), freq="1h", tz="UTC")
             idx5 = pd.date_range("2020-01-01", periods=len(prices) * 12,
                                  freq="5min", tz="UTC")
@@ -135,7 +137,7 @@ class RegimeScreenCase(unittest.TestCase):
             (generated / "RegimeCandidatesGenerated.py").write_text(
                 render_strategy_module(), encoding="utf-8")
             names = [v["class_name"] for v in generate_variants() if v["id"]
-                     in ("R000", "R012")]
+                     in ("R000", "R003")]
             window = {"seg_dir": "seg00", "start": idx1[249].isoformat(),
                       "end_exclusive": (idx1[-1] + pd.Timedelta(hours=1)).isoformat()}
 
@@ -158,11 +160,31 @@ class RegimeScreenCase(unittest.TestCase):
 
             batch = run(names)
             self.assertGreater(sum(batch[n]["trades_count"] for n in names), 0)
+            self.assertTrue(any(t["exit_reason"] == "trailing_stop_loss"
+                                and float(t["profit_ratio"]) > 0
+                                for t in batch["RegimeCandidateR003"]["trades"]),
+                            "beneficio protegido por regla nativa, no max_rate inventado")
             for name in names:
                 single = run([name])[name]
                 self.assertAlmostEqual(batch[name]["profit_abs"], single["profit_abs"],
                                        delta=1e-8)
                 self.assertEqual(batch[name]["trades"], single["trades"])
+
+            # La proteccion también puede truncar una tendencia que recupera.
+            continuation = ([100.0] * 200 + [90.0] * 50 + [150.0] * 20
+                            + [155.0, 157.0, 154.0, 180.0] + [180.0] * 81)
+            self.assertEqual(len(continuation), len(prices))
+            for path, dates, closes in ((seg / PAIR1, idx1, continuation),
+                                        (seg / PAIR5, idx5,
+                                         [p for p in continuation for _ in range(12)])):
+                pd.DataFrame({"date": dates, "open": closes,
+                              "high": [p + 0.5 for p in closes],
+                              "low": [p - 0.5 for p in closes],
+                              "close": closes, "volume": 10.0}).to_feather(str(path))
+            resumed = run(names)
+            self.assertGreater(resumed["RegimeCandidateR000"]["profit_abs"],
+                               resumed["RegimeCandidateR003"]["profit_abs"],
+                               "trailing puede vender antes de la recuperacion")
 
     def test_train_screen_uses_only_new_root_and_ends_no_candidate(self):
         if pd is None:
@@ -211,14 +233,16 @@ class RegimeScreenCase(unittest.TestCase):
                     mock.patch.object(search, "_run_native_batch", side_effect=stub):
                 self.assertEqual(regime.screen_regime(), 1)
                 self.assertEqual(regime.screen_regime(), 1, "resume sin nuevo calculo")
-            self.assertEqual(len(stub.calls), 10, "2 fees × (4 batches + control)")
+            self.assertEqual(len(stub.calls), 18, "2 fees × (8 batches + control)")
             self.assertTrue(all("/regime/" in a[a.index("--export-directory") + 1]
                                 for a in stub.calls))
             self.assertEqual(list((store / "search/sessions").glob("screen-*")), [])
             report_path = next((study / "sessions").glob("screen-*/report.json"))
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual((report["status"], report["verdict"], len(report["records"])),
-                             ("SUCCEEDED", "NO_CANDIDATE", 48))
+                             ("SUCCEEDED", "NO_CANDIDATE", 96))
+            self.assertGreaterEqual(report["analysis_elapsed_s"], 0.0)
+            self.assertEqual(report["native_jobs"]["total"], 18)
             state = json.loads(next((study / "control").glob("campaign-*.json"))
                                .read_text(encoding="utf-8"))
             self.assertGreater(state["consumed"], 0)

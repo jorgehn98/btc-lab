@@ -7,7 +7,7 @@ de este estudio activa un bot por sí solo.
 
 ## Hipótesis registradas antes de ejecutar
 
-Hay 24 configuraciones SMA50/200 spot long: tres cambios binarios cruzados
+Hay 48 configuraciones SMA50/200 spot long: cuatro cambios binarios cruzados
 con los perfiles bajo, medio y alto. La celda original sirve de control bajo
 el mismo warmup y ventanas que las nuevas:
 
@@ -16,8 +16,17 @@ el mismo warmup y ventanas que las nuevas:
 | Reentrada | Solo cruce alcista SMA50/200 y cierre > SMA200 | Además, nuevo cruce del cierre al alza sobre SMA50 con SMA50>SMA200 y cierre>SMA200 |
 | Régimen | Sin pendiente adicional | SMA200 actual > SMA200 de hace 48 velas 1h |
 | Salida | Cruce bajista SMA50/200 o cierre<SMA200 | Además, cierre<SMA50 |
+| Protección | Stop inicial fijo 2 % | Tras beneficio **neto de fees** 2 %, stop nativo a 1 % del máximo alcanzado |
 
 Las señales usan velas 1h cerradas y un contexto común de 249 horas contiguas.
+Para la protección, Freqtrade usa `trailing_stop=True`,
+`trailing_stop_positive_offset=0.02`, `trailing_stop_positive=0.01` y
+`trailing_only_offset_is_reached=True`. Con fee 0,2 % por lado, el umbral
+neto 2 % necesita aproximadamente +2,4 % de subida bruta. Desde 80.000
+hasta un máximo de 82.000, un stop del 1 % del máximo quedaría cerca de
+81.180, **sin garantizar** una ejecución a ese precio si hay salto o
+deslizamiento. La variante control conserva el stop inicial; ambas se
+comparan por señales, riesgo y ventana idénticos.
 Todos usan stop fijo 2 %, una posición long, `dry_run`, sin API, Telegram,
 claves, cortos, futuros ni apalancamiento. El tamaño de posición sigue los
 tres perfiles registrados (riesgo 0,125/0,25/0,50 %; exposición máxima
@@ -30,15 +39,24 @@ al menos 100 operaciones no forzadas, tres años con media diaria neta
 positiva, exceso mediano anual positivo frente a buy-and-hold comparable,
 g sin contribuciones positivas de cierres forzados ≥0, dos variantes
 vecinas de un solo factor positivas y drawdown MTM 5m ≤15 % en todo TRAIN.
-Una media diaria observada no es CAGR ni rentabilidad acumulada de una
-cartera ficticia enlazada entre episodios.
+Se exige además una meta **exploratoria** de al menos 0,05 % neto por día
+observado y por día calendario normalizado en 2019–2022 a fee 0,2 %: para
+la segunda tasa se suman log-retornos de episodios independientes y se
+dividen entre los 1.461 días de esos cuatro años, tratando los huecos
+conocidos como efectivo (retorno 0). Años con datos/fills inválidos no se
+rellenan. El informe incluye ambos denominadores y compara cada celda
+con su buy-and-hold equiparable. Ni esta tasa calendario sintética ni una
+media diaria observada son CAGR real de una cartera enlazada: el objetivo
+de ~20 % anual requiere evidencia adicional sobre capital persistente.
 
 El motor Freqtrade 2026.8 a veces exporta `force_exit` fechado antes de
 una entrada en la última vela 1h cuando se usa detalle 5m. El ledger rechaza
 ese año como inconcluso; **no** se cambian fecha ni precio de los fills.
-Hay como máximo tres finalistas, uno por perfil, sin reemplazar al que falle
-gates posteriores. VALIDATION y TEST continúan cerrados: este PR solo tiene
-servicio TRAIN. Si no hay finalistas, se comunica NO_CANDIDATE.
+Hay como máximo tres **preseleccionados económicos**, uno por perfil; no son
+finalistas ni autorizan VALIDATION/TEST. Una entrega condicional posterior
+debe completar stress y chequeos técnicos en TRAIN sin reemplazos antes de
+conceder cualquier grant. Este PR solo tiene servicio TRAIN. Sin
+preseleccionados, se comunica NO_CANDIDATE.
 
 ## Ejecución local
 
@@ -74,7 +92,15 @@ estudio. El estado y los reportes quedan en `storage/regime/` fuera de Git.
 Un proceso detenido no implica éxito: comprobar el estado terminal en el
 reporte de la sesión y `status` antes de concluir o reanudar.
 
-La campaña aún no tiene resultado económico. Los 163 tests de contratos se
+La campaña aún no tiene resultado económico. Los tests de contratos se
 ejecutan en el host (con skips de pandas/Freqtrade) y la imagen fijada; la
 comparación nativa batch/individual, que requiere consultar metadatos
 públicos de Binance, se ejecuta aparte en el perfil de investigación.
+
+Como motivación, en la campaña previa 22 de los 89 trades nativos de V020
+en 2019–2022 alcanzaron al menos +2,5 % bruto de precio y terminaron con
+pérdida neta a coste de 0,2 % por lado. El máximo nativo de cada trade no
+determina cuánto se habría vendido usando trailing: hay que volver a
+simular la regla completa con velas detalladas, fees y ejecución adversa.
+Véanse la [guía oficial de trailing](https://www.freqtrade.io/en/stable/stoploss/#trailing-stop-loss-only-once-the-trade-has-reached-a-certain-offset)
+y los [callbacks de stop](https://www.freqtrade.io/en/stable/strategy-callbacks/#custom-stoploss).

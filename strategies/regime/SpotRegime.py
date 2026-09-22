@@ -15,9 +15,11 @@ WARMUP = 249
 
 class RegimeSpotBase(_SpotSearchBase):
     startup_candle_count = WARMUP
+    trailing_stop = False
     _REENTRY = False
     _SLOPE_FILTER = False
     _EARLY_EXIT = False
+    _TRAIL = False
 
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         close = pd.to_numeric(dataframe["close"], errors="coerce")

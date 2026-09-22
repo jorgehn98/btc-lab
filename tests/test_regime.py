@@ -1,5 +1,6 @@
 """Contratos puros del estudio SMA50/200 preregistrado (solo TRAIN)."""
 
+import math
 import subprocess
 import sys
 import tempfile
@@ -19,19 +20,19 @@ class RegimeRegistryCase(unittest.TestCase):
         from research.regime import generate_variants, neighbors, render_strategy_module
 
         variants = generate_variants()
-        self.assertEqual(len(variants), 24)
-        self.assertEqual([v["id"] for v in variants], [f"R{i:03d}" for i in range(24)])
-        self.assertEqual(len({v["class_name"] for v in variants}), 24)
+        self.assertEqual(len(variants), 48)
+        self.assertEqual([v["id"] for v in variants], [f"R{i:03d}" for i in range(48)])
+        self.assertEqual(len({v["class_name"] for v in variants}), 48)
         self.assertEqual({v["stop"] for v in variants}, {0.02})
         self.assertEqual({v["risk_profile"] for v in variants}, {"low", "medium", "high"})
         self.assertEqual({tuple(v["params"][k] for k in (
-            "reentry", "slope", "early_exit")) for v in variants},
-            {(r, s, e) for r in (False, True) for s in (False, True)
-             for e in (False, True)})
-        self.assertEqual(neighbors("R000"), ["R003", "R006", "R012"])
-        self.assertEqual(neighbors("R023"), ["R011", "R017", "R020"])
+            "reentry", "slope", "early_exit", "trailing")) for v in variants},
+            {(r, s, e, t) for r in (False, True) for s in (False, True)
+             for e in (False, True) for t in (False, True)})
+        self.assertEqual(neighbors("R000"), ["R003", "R006", "R012", "R024"])
+        self.assertEqual(neighbors("R047"), ["R023", "R035", "R041", "R044"])
         rendered = render_strategy_module(variants)
-        self.assertEqual(rendered.count("class RegimeCandidateR"), 24)
+        self.assertEqual(rendered.count("class RegimeCandidateR"), 48)
         variants[0]["params"]["reentry"] = True
         self.assertFalse(generate_variants()[0]["params"]["reentry"])
 
@@ -43,7 +44,8 @@ class RegimeSelectionCase(unittest.TestCase):
 
         return [{
             "variant_id": v["id"], "role": "train", "year": year,
-            "fee": selection.FEE_PRIMARY, "valid": True, "days": 20.0,
+            "fee": selection.FEE_PRIMARY, "valid": True,
+            "days": float(366 if year == 2020 else 365) if year >= 2019 else 20.0,
             "g": 0.001, "bh_g": 0.0, "max_drawdown_pct": 0.1,
             "trades_nonforced": 30, "turnover": 1.0,
             "g_without_positive_forced": 0.0001,
@@ -58,6 +60,39 @@ class RegimeSelectionCase(unittest.TestCase):
             if rec["variant_id"] == "R000" and rec["year"] == 2022:
                 rec["trades_nonforced"] = 0
         self.assertEqual(choose_train_finalists(records), ["R001", "R002", "R003"])
+
+    def test_calendar_hurdle_is_not_observed_day_hurdle(self):
+        from research.regime_selection import choose_train_finalists
+
+        records = self._records()
+        for rec in records:
+            if rec["year"] in selection.TRAIN_SEL:
+                rec["days"] = 200.0
+                rec["g"] = 0.0008
+        self.assertGreater(0.0008, math.log1p(0.0005))
+        self.assertLess(0.0008 * 800 / 1461, math.log1p(0.0005))
+        self.assertEqual(choose_train_finalists(records), [],
+                         "huecos a efectivo no equivalen a cuatro años observados")
+
+    def test_report_distinguishes_calendar_rate_and_matched_trailing_pairs(self):
+        from research.regime_selection import summarize_train
+
+        records = self._records()
+        for rec in records:
+            if rec["year"] in selection.TRAIN_SEL:
+                rec["days"] = 200.0
+                rec["g"] = 0.0008 if rec["variant_id"] == "R000" else 0.001
+        summary = summarize_train(records)
+        self.assertEqual((summary["unit"], summary["calendar_days"]),
+                         ("daily_log_return", 1461))
+        first = next(row for row in summary["variants"] if row["id"] == "R000")
+        self.assertAlmostEqual(first["g_observed"], 0.0008)
+        self.assertAlmostEqual(first["g_calendar"], 0.0008 * 800 / 1461)
+        self.assertEqual((first["observed_days"], first["calendar_days"]), (800.0, 1461))
+        self.assertEqual(len(summary["trailing_pairs"]), 24)
+        pair = next(p for p in summary["trailing_pairs"] if p["without"] == "R000")
+        self.assertEqual(pair["with"], "R003")
+        self.assertAlmostEqual(pair["delta_g_calendar"], 0.0002 * 800 / 1461)
 
     def test_common_249_hour_context_before_every_evaluation_window(self):
         from operations.regime import effective_windows
@@ -120,7 +155,7 @@ class RegimeSignalCase(unittest.TestCase):
         self.assertEqual(prior["enter_long"].iloc[:-1].tolist(),
                          future["enter_long"].iloc[:-1].tolist())
 
-    def test_native_image_resolves_all_24_generated_classes(self):
+    def test_native_image_resolves_all_48_generated_classes(self):
         try:
             import freqtrade  # noqa: F401
         except ImportError:
@@ -130,6 +165,18 @@ class RegimeSignalCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             generated = Path(tmp) / "RegimeCandidatesGenerated.py"
             generated.write_text(render_strategy_module(), encoding="utf-8")
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("regime_generated_test", generated)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            control = module.RegimeCandidateR000
+            protected = module.RegimeCandidateR003
+            self.assertIs(control.trailing_stop, False)
+            self.assertIs(protected.trailing_stop, True)
+            self.assertEqual(protected.trailing_stop_positive_offset, 0.02)
+            self.assertEqual(protected.trailing_stop_positive, 0.01)
+            self.assertIs(protected.trailing_only_offset_is_reached, True)
             proc = subprocess.run([
                 sys.executable, "-m", "freqtrade", "list-strategies",
                 "--config", "/opt/btc-lab/configs/search.json",

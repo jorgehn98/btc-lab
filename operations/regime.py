@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -14,7 +15,10 @@ from pathlib import Path
 
 from operations import launch, search
 from research.regime import CAMPAIGN_ID, WARMUP, generate_variants, render_strategy_module
-from research.regime_selection import choose_train_finalists, walk_forward_select
+from research.regime_selection import (
+    _CALENDAR_DAYS, _HURDLE, choose_train_finalists, summarize_train,
+    walk_forward_select,
+)
 from research.state import new_state
 
 STORE_NAME = "regime"
@@ -88,6 +92,9 @@ def _definition(snapshot_ref, code_hashes, generated_sha):
         "warmup_1h": WARMUP,
         "drawdown_pct": search.DD_LIMIT,
         "max_finalists": 3,
+        "target": {"minimum_daily_log_observed": _HURDLE,
+                   "minimum_daily_log_calendar": _HURDLE,
+                   "calendar_days": int(_CALENDAR_DAYS)},
     }
 
 
@@ -242,7 +249,7 @@ def screen_regime():
                         or report.get("verdict") != prior["verdict"]):
                     raise ValueError("reporte terminal inconsistente")
                 print(str(report_path))
-                return 0 if prior["verdict"] == "TOP3" else 1
+                return 0 if prior["verdict"] == "PRELIMINARY" else 1
             variants = generate_variants()
             by_id = {v["id"]: v for v in variants}
             windows = effective_windows(snapshot)
@@ -271,6 +278,7 @@ def screen_regime():
             report_path = session / "report.json"
             launch._atomic_create_new(report_path, {
                 "kind": REPORT_KIND, "status": "RUNNING",
+                "created_at": datetime.now(timezone.utc).isoformat(),
                 "definition_hash": manifest["definition_hash"],
                 "input_id": manifest["input_id"],
             })
@@ -286,6 +294,7 @@ def screen_regime():
                 search_root=ROOT)
             if stats["failed"]:
                 raise ValueError(f"{stats['failed']}/{stats['total']} lotes fallidos")
+            analysis_started = time.monotonic()
             episodes = search._candidate_episodes(
                 results, windows, list(search.FEES_SCREEN), sorted(by_id),
                 by_id, str(TRAIN))
@@ -295,14 +304,19 @@ def screen_regime():
                 "train", episodes, windows, list(search.FEES_SCREEN), by_id)
             wf = {str(year): walk_forward_select(records, year)
                   for year in (2019, 2020, 2021, 2022)}
+            metrics = summarize_train(records)
             top3 = choose_train_finalists(records)
             if top3:
-                state["train_ids"] = list(top3)
-                state["stage"] = "TRAIN_FROZEN"
-            verdict = "TOP3" if top3 else "NO_CANDIDATE"
+                state["preselected_ids"] = list(top3)
+                state["stage"] = "TRAIN_PRESELECTED"
+            verdict = "PRELIMINARY" if top3 else "NO_CANDIDATE"
             _finish(state, state_path, report_path, {
                 "kind": REPORT_KIND, "status": "SUCCEEDED",
-                "verdict": verdict, "top3": list(top3), "records": records,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "verdict": verdict, "preliminary_ids": list(top3),
+                "records": records, "metrics": metrics,
+                "analysis_elapsed_s": time.monotonic() - analysis_started,
+                "native_jobs": stats,
                 "wf_descriptive": wf, "control_coverage": control,
                 "definition_hash": manifest["definition_hash"],
                 "input_id": manifest["input_id"],
@@ -320,6 +334,7 @@ def screen_regime():
                     if previous.get("status") == "RUNNING":
                         launch._atomic_replace(report_path, {
                             **previous, "status": "FAILED", "verdict": "FAILED",
+                            "finished_at": datetime.now(timezone.utc).isoformat(),
                             "error": f"{type(exc).__name__}: {exc}",
                         })
             except (FileNotFoundError, ValueError, OSError, RuntimeError):
@@ -337,7 +352,9 @@ def status_regime():
     print(json.dumps({
         "campaign_id": CAMPAIGN_ID, "definition_hash": manifest["definition_hash"],
         "stage": state["stage"], "consumed": state["consumed"],
-        "budget_limit": state["budget_limit"], "train_ids": state["train_ids"],
+        "budget_limit": state["budget_limit"],
+        "preselected_ids": state.get("preselected_ids"),
+        "train_ids": state["train_ids"],
         "phase_reports": state["phase_reports"], "grants": state["grants"],
         "test_consumed": state["test_consumed"],
     }, indent=2, sort_keys=True))
