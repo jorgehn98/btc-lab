@@ -838,6 +838,52 @@ class ResearchSnapshotCase(unittest.TestCase):
                       for p in (res / "snapshots").glob("snap-*.json")]
             self.assertNotIn("FROZEN", frozen, f"nada FROZEN con hash distinto: {frozen}")
 
+    def test_snapshot_rechaza_mutacion_durante_load(self):
+        # cmd_snapshot importa pandas al arrancar: runtime autoritativo.
+        _require_market(self)
+        from operations import research
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res = Path(tmp) / "res"
+            dl = res / "downloads"
+            dl.mkdir(parents=True)
+            frame = _make_5m_frame(24, "2021-06-01")
+            feather = dl / research._pair_file("BTC/USDT", "5m")
+            frame.to_feather(str(feather))
+            file_hash = launch.file_hash(feather)
+            (dl / "dl-abc.json").write_text(json.dumps({
+                "kind": research.DOWNLOAD_KIND, "status": "SUCCEEDED",
+                "download_id": "d1", "pair": "BTC/USDT",
+                "timerange": research.TRAIN_TIMERANGE,
+                "datadir": str(dl), "data_file_sha256": file_hash,
+            }), encoding="utf-8")
+            hashes = research._code_hashes(ROOT)
+            research_input = {
+                "kind": research.INPUT_KIND, "status": "PREPARED",
+                "image_ref": launch.PINNED_IMAGE, "commit": BASELINE_COMMIT,
+                "input_id": "in1", **hashes,
+            }
+            input_path = Path(tmp) / "input.json"
+            input_path.write_text(json.dumps(research_input), encoding="utf-8")
+            real_load = research._load_5m_frame
+
+            def _mutating_load(paths):
+                loaded = real_load(paths)
+                tampered = loaded.copy()
+                tampered.loc[0, ["open", "high", "low", "close"]] = [101.0, 101.5, 100.5, 101.0]
+                tampered.to_feather(paths[0])
+                return loaded
+
+            with mock.patch.object(research, "CONTAINER_RESEARCH", str(res)), \
+                    mock.patch.object(research, "CONTAINER_INPUT", str(input_path)), \
+                    mock.patch.object(research, "CONTAINER_CODE", str(ROOT)), \
+                    mock.patch.object(research, "_load_5m_frame", new=_mutating_load):
+                rc = research.cmd_snapshot("dl-abc.json")
+            self.assertNotEqual(rc, 0, "mutacion durante load no congela")
+            frozen = [json.loads(p.read_text(encoding="utf-8")).get("status")
+                      for p in (res / "snapshots").glob("snap-*.json")]
+            self.assertNotIn("FROZEN", frozen, f"nada FROZEN con mutacion durante load: {frozen}")
+
 
 class ResearchNativeCase(unittest.TestCase):
     def test_zip_sin_estrategia_o_sin_trades_no_es_exito(self):
@@ -1381,6 +1427,130 @@ class ResearchBiasCase(unittest.TestCase):
         self.assertEqual(research._verdict_status("FAIL"), "FAILED")
         self.assertEqual(research._verdict_status("INCONCLUSIVE"), "INCONCLUSIVE")
         self.assertEqual(research._verdict_status("OTRO"), "INCONCLUSIVE")
+
+    def _bias_tree_largo(self, tmp, seg_frame=None):
+        """Snapshot FROZEN con segmento >=1000 velas; seg feather real o bytes."""
+        from operations import research
+
+        res = Path(tmp) / "res"
+        snaps = res / "snapshots"
+        snap_dir = snaps / "snap-largo"
+        snap_dir.mkdir(parents=True)
+        whole_5m = snap_dir / research._pair_file("BTC/USDT", "5m")
+        whole_1h = snap_dir / research._pair_file("BTC/USDT", "1h")
+        whole_5m.write_bytes(os.urandom(32))
+        whole_1h.write_bytes(os.urandom(32))
+        seg_dir = snap_dir / "seg00"
+        seg_dir.mkdir(parents=True)
+        seg_5m = seg_dir / research._pair_file("BTC/USDT", "5m")
+        seg_1h = seg_dir / research._pair_file("BTC/USDT", "1h")
+        seg_5m.write_bytes(os.urandom(16))
+        if seg_frame is None:
+            seg_1h.write_bytes(os.urandom(16))
+        else:
+            seg_frame.to_feather(str(seg_1h))
+        start = "2020-01-01T00:00:00+00:00"
+        (snaps / "snap-largo.json").write_text(json.dumps({
+            "kind": research.SNAPSHOT_KIND, "status": "FROZEN",
+            "snapshot_id": "largo", "snapshot_dir": snap_dir.name,
+            "whole_5m_sha256": launch.file_hash(whole_5m),
+            "whole_1h_sha256": launch.file_hash(whole_1h),
+            "segments_meta": [{
+                "index": 0, "length": 1100,
+                "start": start,
+                "end_exclusive": "2020-02-15T20:00:00+00:00",
+                "eval_start": start,
+                "seg_dir": "seg00",
+                "file_5m_sha256": launch.file_hash(seg_5m),
+                "file_1h_sha256": launch.file_hash(seg_1h),
+            }],
+        }), encoding="utf-8")
+        input_path = Path(tmp) / "input.json"
+        input_path.write_text(json.dumps({
+            "kind": research.INPUT_KIND, "status": "PREPARED",
+            "image_ref": launch.PINNED_IMAGE, "commit": BASELINE_COMMIT,
+            "input_id": "in1", **research._code_hashes(ROOT),
+        }), encoding="utf-8")
+        return res, input_path
+
+    @staticmethod
+    def _fake_bias_engine(ref_trades, csv_row):
+        import zipfile
+
+        def _run(argv, timeout_s, log_path):
+            args = [str(a) for a in argv]
+            if args[1] == "backtesting":
+                export = Path(args[args.index("--export-directory") + 1])
+                payload = {"SmaCrossBaseline": {
+                    "profit_total_abs": 1.0, "profit_total": 0.01,
+                    "total_trades": len(ref_trades), "max_drawdown_abs": 0.5,
+                    "trades": ref_trades}}
+                with zipfile.ZipFile(str(export / "r.zip"), "w") as bundle:
+                    bundle.writestr("backtest-result-a.json", json.dumps(payload))
+            elif args[1] == "lookahead-analysis":
+                csv_path = Path(args[args.index("--lookahead-analysis-exportfilename") + 1])
+                csv_path.write_text(
+                    "filename,strategy,has_bias,total_signals,"
+                    "biased_entry_signals,biased_exit_signals,biased_indicators\n"
+                    + csv_row + "\n", encoding="utf-8")
+            Path(log_path).write_text("ok", encoding="utf-8")
+            return 0, False
+
+        return _run
+
+    def _run_bias_session(self, res, input_path, engine, own_verdict=None):
+        from operations import research
+
+        patches = [
+            mock.patch.object(research, "CONTAINER_RESEARCH", str(res)),
+            mock.patch.object(research, "CONTAINER_INPUT", str(input_path)),
+            mock.patch.object(research, "CONTAINER_CODE", str(ROOT)),
+            mock.patch.object(research, "_run_streaming", side_effect=engine),
+        ]
+        if own_verdict is not None:
+            patches.append(mock.patch.object(
+                research, "_own_sma_gate", return_value=own_verdict))
+        with contextlib.ExitStack() as stack:
+            for entered in patches:
+                stack.enter_context(entered)
+            rc = research.cmd_bias("snap-largo.json")
+        gates = list((res / "sessions").glob("bias-*/gate.json"))
+        self.assertEqual(len(gates), 1, f"un gate: {gates}")
+        return rc, json.loads(gates[0].read_text(encoding="utf-8"))
+
+    def test_sesgo_conocido_gana_a_cobertura_parcial(self):
+        _require_strategy(self)
+        ref = ([{"enter_tag": "sma_bull", "exit_reason": "sma_bear"}] * 70
+               + [{"enter_tag": "sma_bull", "exit_reason": "stop_loss"}] * 62
+               + [{"enter_tag": "sma_bull", "exit_reason": "force_exit"}])
+        self.assertEqual(len(ref), 133, "forma del ref nativo")
+        prices = [100.0] * 500 + [200.0] * 300 + [100.0] * 300
+        with tempfile.TemporaryDirectory() as tmp:
+            res, input_path = self._bias_tree_largo(
+                tmp, _make_1h_frame(prices, start="2020-01-01"))
+            rc, gate = self._run_bias_session(
+                res, input_path,
+                self._fake_bias_engine(ref, "f.csv,SmaCrossBaseline,True,5,1,0,"))
+        self.assertEqual(rc, 1, "sesgo conocido no es exito")
+        self.assertEqual(gate.get("verdict"), "FAIL", gate)
+        self.assertNotEqual(gate.get("verdict"), "INCONCLUSIVE", "sesgo conocido es FAIL")
+        self.assertEqual(gate.get("lookahead", {}).get("parsed", {}).get("total_signals"), 5)
+        self.assertEqual(gate.get("reference", {}).get("analyzable"), 132)
+
+    def test_own_fail_gana_a_cobertura_parcial(self):
+        from operations import research  # noqa: F401 (seam en helpers)
+
+        ref = ([{"enter_tag": "sma_bull", "exit_reason": "sma_bear"}] * 70
+               + [{"enter_tag": "sma_bull", "exit_reason": "stop_loss"}] * 62
+               + [{"enter_tag": "sma_bull", "exit_reason": "force_exit"}])
+        with tempfile.TemporaryDirectory() as tmp:
+            res, input_path = self._bias_tree_largo(tmp)
+            rc, gate = self._run_bias_session(
+                res, input_path,
+                self._fake_bias_engine(ref, "f.csv,SmaCrossBaseline,False,5,0,0,"),
+                own_verdict={"verdict": "FAIL", "reason": "sma simulada"})
+        self.assertEqual(rc, 1, "own fail no es exito")
+        self.assertEqual(gate.get("verdict"), "FAIL", gate)
 
 
 class ResearchBenchmarkCase(unittest.TestCase):

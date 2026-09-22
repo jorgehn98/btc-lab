@@ -358,7 +358,8 @@ def _run_streaming(argv: list, timeout_s: int, log_path: Path) -> tuple:
             _write(tail)
         except OSError:
             pass
-        raise OSError(f"reader: {type(primary).__name__}") from primary
+        errno = getattr(primary, "errno", None)
+        raise OSError(f"reader: {type(primary).__name__} errno={errno}") from primary
     if cleanup_error is not None:
         try:
             _write(tail)
@@ -608,6 +609,9 @@ def cmd_snapshot(download_ref: str) -> int:
                 if launch.file_hash(expected_5m) != dl_manifest.get("data_file_sha256"):
                     raise ValueError("feather 5m modificado tras download")
                 frame_5m = _load_5m_frame([str(expected_5m)])
+                loaded_hash = launch.file_hash(expected_5m)
+                if not dl_manifest.get("data_file_sha256") or loaded_hash != dl_manifest.get("data_file_sha256"):
+                    raise ValueError("feather 5m modificado durante load")
                 validate_ohlcv(frame_5m, TRAIN_START, TRAIN_END, 5)
                 hourly = aggregate_hourly(frame_5m)
                 segments = contiguous_segments(hourly)
@@ -654,7 +658,7 @@ def cmd_snapshot(download_ref: str) -> int:
                     "segments": int(len(segments)),
                     "segments_meta": seg_meta,
                     "gaps": gaps,
-                    "source_5m_sha256": launch.file_hash(expected_5m),
+                    "source_5m_sha256": loaded_hash,
                     "source_download_sha256": dl_manifest.get("data_file_sha256"),
                     "whole_5m_sha256": launch.file_hash(whole_5m),
                     "whole_1h_sha256": launch.file_hash(whole_1h),
@@ -1428,8 +1432,22 @@ def cmd_bias(snapshot_ref: str) -> int:
             look_parsed, look_error = (None, None)
             if look_exec_error is None and not look_timeout and look_rc == 0:
                 look_parsed, look_error = _parse_lookahead_csv(look_csv)
-            # Decide con evidencia estructurada, no por un substring del log.
-            if look_exec_error or rec_exec_error:
+            # Orden formal del gate tras parse CSV: FAIL probado (own y sesgo
+            # confirmado) antes que cualquier INCONCLUSIVE; luego errores de
+            # ejecucion, timeouts, salidas nativas y minimos de cobertura.
+            if own.get("verdict") == "FAIL":
+                verdict = {"verdict": "FAIL",
+                           "reason": own.get("reason", ""),
+                           "evidence": {"own_sma": own}}
+            elif look_parsed and (look_parsed["has_bias"]
+                    or look_parsed["biased_entry_signals"] > 0
+                    or look_parsed["biased_exit_signals"] > 0
+                    or look_parsed["biased_indicators"]):
+                verdict = {"verdict": "FAIL", "reason": "lookahead marca sesgo",
+                           "evidence": {"lookahead": look_parsed,
+                                        "analyzable": ref_info.get("analyzable"),
+                                        "ref_trades": ref_info.get("count")}}
+            elif look_exec_error or rec_exec_error:
                 verdict = {"verdict": "INCONCLUSIVE",
                            "reason": look_exec_error or rec_exec_error}
             elif look_timeout or rec_timeout:
@@ -1454,13 +1472,6 @@ def cmd_bias(snapshot_ref: str) -> int:
                            "reason": "lookahead incompleto frente a la referencia analizable",
                            "evidence": {"lookahead_total": look_parsed["total_signals"],
                                         "analyzable": ref_info.get("analyzable")}}
-            elif look_parsed["has_bias"] or look_parsed["biased_entry_signals"] > 0 \
-                    or look_parsed["biased_exit_signals"] > 0 \
-                    or look_parsed["biased_indicators"]:
-                verdict = {"verdict": "FAIL", "reason": "lookahead marca sesgo",
-                           "evidence": look_parsed}
-            elif rec_timeout:
-                verdict = {"verdict": "INCONCLUSIVE", "reason": "timeout en recursive"}
             elif rec_rc != 0:
                 tail = _read_tail(rec_log, 8192).lower()
                 # Warnings cosméticos no deciden el gate; sí cobertura/errores.
