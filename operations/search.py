@@ -1049,6 +1049,10 @@ def _check_resolved_ids(phase: str, payload: dict, state: dict) -> None:
     """Consistencia semantica elegidos <=> congelados del estado."""
     if phase == "screen":
         frozen = state.get("train_ids")
+        if payload.get("verdict") == "NO_CANDIDATE":
+            if frozen or payload.get("top9"):
+                raise ValueError("screen NO_CANDIDATE con top9 congelado")
+            return
         if not frozen:
             raise ValueError("screen resuelto sin top9 congelado")
         if sorted(str(v) for v in (payload.get("top9") or [])) != sorted(
@@ -2641,6 +2645,11 @@ def cmd_report() -> int:
         manifest_in = _load_input()
         _verify_current_against_input(manifest_in)
         state, _ = _load_state()
+        screen_ref = (state.get("phase_reports") or {}).get("screen")
+        screen_verdict = None
+        if isinstance(screen_ref, dict) and screen_ref.get("status") == "SUCCEEDED":
+            screen_report, _ = resolve_phase_report(state, "screen")
+            screen_verdict = screen_report.get("verdict")
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"report: input/codigo/estado no valido: {exc}", file=sys.stderr)
         return 2
@@ -2648,7 +2657,10 @@ def cmd_report() -> int:
     train_ids = state.get("train_ids")
     validation_ids = state.get("validation_ids")
     test_candidate = state.get("test_candidate")
-    if stage == "REGISTERED" and not train_ids:
+    if screen_verdict == "NO_CANDIDATE":
+        verdict = "NO_CANDIDATE"
+        reasons = ["screen sin finalistas TRAIN elegibles; holdout no abierto"]
+    elif stage == "REGISTERED" and not train_ids:
         verdict = "NOT_STARTED"
         reasons = ["screen pendiente de ejecucion real"]
     elif train_ids is not None and len(train_ids) == 0:

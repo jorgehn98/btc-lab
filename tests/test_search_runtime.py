@@ -19,6 +19,7 @@ Run imagen: docker compose --profile tools run --rm \
 """
 
 import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -560,6 +561,35 @@ class StaleStateCase(unittest.TestCase):
             live = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(live.get("consumed"), S.BUDGET_SECONDS,
                              "sin overwrite del consumo concurrente")
+
+
+class ReportTerminalCase(unittest.TestCase):
+    def test_screen_no_candidate_report_and_resume_are_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _screen_env(tmp, [_seg_one()])
+            output = io.StringIO()
+            with _search_paths(env), contextlib.redirect_stdout(output):
+                self.assertEqual(S.cmd_report(), 0)
+            self.assertEqual(json.loads(output.getvalue())["verdict"], "NOT_STARTED")
+
+            report_path = env["search"] / "sessions" / "screen-1" / "report.json"
+            report = {"status": "SUCCEEDED", "verdict": "NO_CANDIDATE",
+                      "definition_hash": env["definition_hash"], "top9": []}
+            _write(report_path, json.dumps(report, sort_keys=True))
+            state = json.loads(env["state_path"].read_text(encoding="utf-8"))
+            state["phase_reports"] = {"screen": {
+                "path": "sessions/screen-1/report.json",
+                "sha256": launch.file_hash(report_path),
+                "status": "SUCCEEDED", "verdict": "NO_CANDIDATE"}}
+            _write(env["state_path"], json.dumps(state, sort_keys=True))
+
+            output = io.StringIO()
+            with _search_paths(env), contextlib.redirect_stdout(output):
+                self.assertEqual(S.cmd_report(), 1)
+            self.assertEqual(json.loads(output.getvalue())["verdict"], "NO_CANDIDATE")
+            with _search_paths(env), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(S.cmd_screen(), 1)
+            self.assertEqual(len(list((env["search"] / "sessions").glob("screen-*/report.json"))), 1)
 
 
 class HoldoutGateCase(unittest.TestCase):

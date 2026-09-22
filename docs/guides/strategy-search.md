@@ -3,7 +3,7 @@
 Esta guía describe la campaña `btc-strategy-search-pr02`. Es una búsqueda
 experimental reproducible sobre BTC/USDT spot; no es una promesa de rentabilidad,
 un óptimo global ni una autorización para activar un servicio. `smoke` y
-`baseline` permanecen detenidos mientras la campaña está pendiente de decisión.
+`baseline` permanecen detenidos. SCREEN terminó sin finalistas aptos.
 
 ## Alcance congelado
 
@@ -112,11 +112,43 @@ congelar TRAIN, `prepare` solo permite continuar cuando todos los intentos fuero
 `FAILED` y todavía no existen selecciones, grants ni reportes de fase; archiva el
 estado anterior y conserva íntegros intentos, ejecuciones y segundos consumidos.
 
-La verificación actual es de contratos, no de resultados de campaña: 153 tests
-se ejecutan en host y en la imagen fijada, y la ruta nativa sintética comprueba
+La verificación de contratos consta de 154 tests: en el host se omiten los que
+requieren dependencias de la imagen fijada, donde se ejecutan todos. La ruta
+nativa sintética comprueba
 lotes de tres frente a tres ejecuciones individuales y resuelve las 72 clases.
-Esto demuestra que el runner puede validar su mecánica; no demuestra que la
-búsqueda TRAIN se haya completado ni que exista una candidata.
+Estos tests protegen la mecánica del runner; el resultado económico de TRAIN se
+documenta a continuación y no convierte una configuración en candidata.
+
+## Resultado de TRAIN (campaña cerrada)
+
+SCREEN ejecutó 806 lotes nativos sobre 31 ventanas TRAIN, reconstruyó 864
+registros anuales y concluyó `SUCCEEDED / NO_CANDIDATE`, sin TOP9. El consumo
+acumulado fue de 5.305,73 segundos, incluidos 16,25 segundos de tres intentos
+técnicos fallidos anteriores, conservados en el estado. No se prepararon ni
+abrieron VALIDATION o TEST; no se activó ningún piloto.
+
+La evidencia quedó ligada al código del commit `c522bc7` y a su definición
+congelada: cambios posteriores del runner no autorizan a reanudar ese input ni
+a reemplazar sus hashes. Otro experimento necesita identidad y estado propios.
+
+Entre las variantes con años evaluables, la mayor media diaria neta ponderada
+observada en 2019–2022 a coste de 0,2 % por lado fue V020 (tendencia SMA50/200,
+riesgo alto, stop 2 %): 0,01253 % por día, frente a 0,02298 % del buy-and-hold
+comparable. Tuvo 84 operaciones no forzadas y 2 de 4 años positivos; los mínimos
+eran 100 operaciones y 3 años. V044 (ruptura 168/84, riesgo alto, stop 2 %)
+registró 0,00796 % por día, 90 operaciones y 2 años positivos, además de un
+exceso mediano negativo frente a buy-and-hold. Estas tasas diarias observadas
+no son rentabilidad acumulada ni CAGR y **no** son una lista de estrategias
+aprobadas.
+
+Doce variantes quedaron inconclusas en un año: un fill `force_exit` exportado
+por Freqtrade 2026.8 cierra cinco minutos antes de su apertura. El motor usa
+la última vela principal de 1h para el cierre pendiente aunque la entrada
+ocurrió en una vela detallada de 5m posterior; el ledger rechaza correctamente
+esa secuencia. No se cambian a mano fecha ni precio de esos fills ni se
+presentan las doce variantes como perdedoras. La siguiente investigación
+requiere una definición y pruebas nuevas; este resultado congelado no autoriza
+recalcular sobre VALIDATION o TEST.
 
 ## Apertura de VALIDATION y TEST
 
@@ -178,9 +210,9 @@ El código permite generar un paper bundle únicamente cuando el resultado TEST
 tiene `PASS` económico y técnico. La activación futura sería una decisión manual
 del coordinator; no existe un servicio que la active por la existencia del bundle.
 
-Esta documentación no afirma que la búsqueda haya terminado, que exista un
-ganador o que no exista uno. Solo debe publicarse un resumen agregado de fases
-con estado, cobertura, costes, drawdown y linaje. No se publican CSV, feather,
+La campaña terminó en TRAIN sin candidata elegible. Solo debe publicarse un
+resumen agregado de fases con estado, cobertura, costes, drawdown y linaje. No
+se publican CSV, feather,
 DB, logs completos, manifiestos con rutas locales ni valores de credenciales.
 
 Referencias: `operations/search.py`, `operations/history.py`,
