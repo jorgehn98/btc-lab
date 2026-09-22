@@ -1,4 +1,4 @@
-"""T05 ultimo chunk RED: runtime IO del runner search (borde nativo).
+"""Contratos de runtime del runner search (borde nativo).
 
 Fuente: operations/search.py REAL (screen/finalists/validation/test, sin
 placeholders) + research/state + research/evaluation + grants de

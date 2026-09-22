@@ -1,11 +1,11 @@
-"""T05 segundo chunk RED: seleccion pura y estado de campana (stdlib).
+"""Contratos de seleccion pura y estado de campana (stdlib).
 
 Fuente: tasks/05.md + PRD (72 spot, DD 15% MTM, presupuesto 12h, TEST unico).
 Solo tests en raiz; sin prod/docs/commits/work/agentes, sin datos ni runners
 nuevos. Reutiliza el registro canonico real (research.campaign) y no
 reimplementa vecinos: usa neighbors() para el gate. Sin mocks ni IO.
 
-Seams cerrados propuestos al coordinador (RED exacto, implementador hace GREEN):
+Contratos cubiertos:
 - research/selection.py (stdlib): walk_forward_select(records, evaluation_year),
   choose_train_finalists(records), choose_validation_candidates(records,
   train_ids, bias_verdicts), choose_test_candidate(validation_records,

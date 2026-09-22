@@ -8,9 +8,9 @@ Intervalos semiabiertos UTC (PRD aprobado):
 
 No hay fechas configurables ni flags de bypass. La autorizacion pura valida
 forma (conteos, duplicados, extras) pero NO sustituye la autorizacion
-persistente de runtime: VAL/TEST exigen artefacto de fase verificable
-(protocolo PR02). En PR01 el runner solo abre TRAIN; roles externos quedan
-fail-closed hasta que ese protocolo exista.
+persistente de runtime: VAL/TEST exigen un artefacto de fase verificable.
+El runner publico de TRAIN sigue separado del flujo PR02 con grants para roles
+externos.
 """
 
 from __future__ import annotations

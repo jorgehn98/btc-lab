@@ -208,9 +208,15 @@ services:
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/search/control:/lab-search/control:rw,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/search/sessions:/lab-search/sessions:rw,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/search/generated:/lab-search/generated:ro,z
-      - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/snapshots/train-snap-b6ae65f3:/lab-search/snapshots/train:ro,z
       - type: bind
-        source: ${LAB_STORAGE_ROOT:?set absolute storage root}/history/snapshots/train-snap-2026-09-22T114307.436903Z-b5914210-b6ae.json
+        source: ${LAB_SEARCH_TRAIN_SNAPSHOT:-${LAB_STORAGE_ROOT}/history/snapshots/train-snap-b6ae65f3}
+        target: /lab-search/snapshots/train
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+      - type: bind
+        source: ${LAB_SEARCH_TRAIN_MANIFEST:-${LAB_STORAGE_ROOT}/history/snapshots/train-snap-2026-09-22T114307.436903Z-b5914210-b6ae.json}
         target: /lab-search/snapshots/train-manifest.json
         read_only: true
         bind:
@@ -249,6 +255,13 @@ services:
           create_host_path: false
           selinux: z
       - type: bind
+        source: ${LAB_SEARCH_VALIDATION_MANIFEST:-/nonexistent/btc-lab-search-validation-manifest-unprepared.json}
+        target: /lab-search/snapshots/validation-manifest.json
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+      - type: bind
         source: ${LAB_SEARCH_INPUT:-/nonexistent/btc-lab-search-unprepared.json}
         target: /lab-search/input.json
         read_only: true
@@ -276,6 +289,13 @@ services:
       - type: bind
         source: ${LAB_SEARCH_TEST_SNAPSHOT:-/nonexistent/btc-lab-search-test-unprepared}
         target: /lab-search/snapshots/test
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
+      - type: bind
+        source: ${LAB_SEARCH_TEST_MANIFEST:-/nonexistent/btc-lab-search-test-manifest-unprepared.json}
+        target: /lab-search/snapshots/test-manifest.json
         read_only: true
         bind:
           create_host_path: false

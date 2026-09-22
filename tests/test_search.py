@@ -1,11 +1,11 @@
-"""T05 primer chunk RED: registro 72, senales causales y selectores puros.
+"""Contratos de registro, senales causales y selectores puros de la campana.
 
 Fuente: work/btc-strategy-search/tasks/05.md + PRD (campana 72 spot,
 DD 15% MTM, metodo parent market.equity/market.history). Solo tests en raiz,
 sin prod/docs/commits/work/agentes. Reutiliza DataContract mocks y ledger
 existentes; no prueba texto de Compose/docs ni ejecuta datos/backtests.
 
-Seams acordados (propuesta cerrada al coordinador, RED exacto):
+Contratos cubiertos:
 - research/campaign.py puro: generate_variants() -> list[dict] estable
   (id, familia, seed_index, stop 0.02/0.04, risk low/medium/high,
   risk_pct 0.00125/0.0025/0.005, exposure 0.1/0.2/0.4), neighbors(variant_id)
@@ -19,10 +19,8 @@ Seams acordados (propuesta cerrada al coordinador, RED exacto):
   solo long, sizing risk/(stop+0.006) cap exposure (sin techo 1000 salvo
   baseline control), callbacks 0/False sin saldo + revalida notional.
 
-Diferido al segundo chunk (schema stateful aun no acordado, se reporta):
-transiciones/budget campana, consumo TEST antes de lectura, resume mismo
-input inmutable, intentos fallidos/budget 12h, validacion 9/3/1 y gates
-economicos completos con ledger real. Este archivo no los impone.
+Los contratos de estado, presupuesto, holdout y gates economicos completos se
+cubren en los tests de runtime y de seleccion correspondientes.
 
 Run host (stdlib): python3 -m unittest discover -s tests -v (estrategia
 requiere imagen y se omite sin pandas/freqtrade). Run imagen fijada con
@@ -377,7 +375,7 @@ class NeighborsCase(unittest.TestCase):
 class SelectorScopeCase(unittest.TestCase):
     def test_selection_years_exact_and_independent(self):
         camp = _campaign()
-        # Constantes cerradas propuestas; acepta TRAIN_YEARS o SELECTION_YEARS.
+        # Constantes cerradas; acepta TRAIN_YEARS o SELECTION_YEARS.
         train = getattr(camp, "TRAIN_YEARS", None)
         val = getattr(camp, "VAL_YEARS", None)
         test = getattr(camp, "TEST_YEARS", None)

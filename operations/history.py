@@ -296,7 +296,7 @@ def _locked():
 
 
 def prepare_history(code_root, storage_root, image_ref, role: str = "train") -> str:
-    """Preflight HOST (solo train en PR01); devuelve manifiesto unico."""
+    """Preflight HOST para TRAIN publico; devuelve un manifiesto unico."""
     if role != "train":
         raise ValueError(f"prepare PR01 solo train, no {role!r} (ver phase-contract)")
     if not isinstance(image_ref, str) or image_ref.strip() != launch.PINNED_IMAGE:

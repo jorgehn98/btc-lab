@@ -4,8 +4,8 @@ Fases REALES (sin placeholders): `screen` (TRAIN 72 fees 0.001/0.002 +
 top9), `finalists` (top9 stress 0.0015/0.003 + bias nativo + top3),
 `validation` (max3 all4 fees + candidata) y `test` (una all4 fees +
 bundle paper solo si PASS). Autorizacion holdout via `prepare-phase`
-(host, grants + inputs de rol + bindings de snapshot). No se declara done
-de la campana completa: el coordinator arranca cada fase tras commit.
+(host, grants + inputs de rol + bindings de snapshot).
+
 
 Cierre screen:
 - Host `prepare --train-snapshot <basename>`: Git limpio + imagen fijada,
