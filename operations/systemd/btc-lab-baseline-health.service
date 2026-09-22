@@ -1,0 +1,11 @@
+[Unit]
+Description=btc-lab baseline health check (oneshot, cada 5 min via timer)
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30
+ExecStart=/usr/bin/python3 "/home/jorgextech/dev/personal/Crypto Trading Bot/operations/health.py" "--container" "btc-lab-baseline-1" "--logfile" "/home/jorgextech/dev/personal/Crypto Trading Bot/storage/runtime/baseline/freqtrade.log" "--output" "/home/jorgextech/dev/personal/Crypto Trading Bot/storage/health-baseline.json" "--lock" "/home/jorgextech/dev/personal/Crypto Trading Bot/storage/health-baseline.lock"
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true

@@ -1,0 +1,55 @@
+{
+  "exchange": {
+    "name": "binance",
+    "key": "",
+    "secret": "",
+    "password": "",
+    "pair_whitelist": [
+      "BTC/USDT"
+    ],
+    "pair_blacklist": []
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "trading_mode": "spot",
+  "dry_run": true,
+  "dry_run_wallet": 10000,
+  "stake_currency": "USDT",
+  "stake_amount": 1000,
+  "max_open_trades": 1,
+  "timeframe": "1h",
+  "strategy": "SmaCrossBaseline",
+  "entry_pricing": {
+    "price_side": "other",
+    "use_order_book": false,
+    "order_book_top": 1,
+    "price_last_balance": 0.0
+  },
+  "exit_pricing": {
+    "price_side": "other",
+    "use_order_book": false,
+    "order_book_top": 1,
+    "price_last_balance": 0.0
+  },
+  "initial_state": "running",
+  "internals": {
+    "heartbeat_interval": 60
+  },
+  "api_server": {
+    "enabled": false,
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8080,
+    "username": "",
+    "password": "",
+    "jwt_secret_key": "DISABLED-NO-API-SERVER-PLACEHOLDER-0000"
+  },
+  "telegram": {
+    "enabled": false,
+    "token": "",
+    "chat_id": ""
+  },
+  "fee": 0.001
+}
