@@ -221,7 +221,12 @@ def _grant_ids(role: str, grant: dict) -> list:
 
 
 def _require_authorized_role(manifest_in: dict) -> str:
-    """Rol del input con autorizacion verificada (train directo, resto grant)."""
+    """Rol del input con autorizacion verificada (train directo, resto grant).
+
+    Los roles externos exigen ADEMAS la autoridad canonica RO: el grant del
+    input debe estar registrado en el estado canonico
+    (/lab-search-authority). Sin ese montaje, bloquean; TRAIN funciona sin el.
+    """
     role = str(manifest_in.get("role") or "train")
     if role == "train":
         _require_train_only(role)
@@ -237,6 +242,15 @@ def _require_authorized_role(manifest_in: dict) -> str:
         list(manifest_in.get("expected_ids") or []),
         str(manifest_in.get("report_sha256") or ""),
     )
+    try:
+        from operations.search import authorize_holdout, load_authority
+    except ImportError as exc:
+        raise ValueError(f"{role}: autoridad no disponible: {exc}") from exc
+    try:
+        authority = load_authority()
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        raise ValueError(f"{role}: autoridad RO ausente o ilegible: {exc}") from exc
+    authorize_holdout(authority, role, grant)
     return role
 
 
@@ -377,6 +391,22 @@ def prepare_history_with_grant(code_root, storage_root, image_ref, role: str,
     store = Path(storage_root)
     if not code.is_dir():
         raise FileNotFoundError(f"codigo no encontrado: {code}")
+    # Autoridad canonica del store (no el dict que trae el llamante): el
+    # grant debe estar registrado en store/search/control. Sin flags JSON
+    # externos que valgan como autoridad.
+    authority_path = store / "search" / "control"
+    authority_files = sorted(authority_path.glob("campaign-*.json"))
+    if len(authority_files) != 1:
+        raise ValueError("estado canonico unico ausente en search/control")
+    try:
+        authority = json.loads(authority_files[0].read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"estado canonico ilegible: {exc}") from exc
+    try:
+        from operations.search import authorize_holdout
+    except ImportError as exc:
+        raise ValueError(f"autoridad no disponible: {exc}") from exc
+    authorize_holdout(authority, role, grant)
     try:
         config = json.loads((code / CONFIG_REL).read_text(encoding="utf-8"))
     except FileNotFoundError:

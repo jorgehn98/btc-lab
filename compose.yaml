@@ -158,6 +158,7 @@ services:
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/downloads:/lab-history/downloads:rw,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/snapshots:/lab-history/snapshots:rw,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/control:/lab-history/control:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/search/control:/lab-search-authority/control:ro,z
       - type: bind
         source: ${LAB_HISTORY_INPUT:-/nonexistent/btc-lab-history-unprepared.json}
         target: /lab-history/input.json
@@ -183,6 +184,7 @@ services:
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/snapshots:/lab-history/snapshots:ro,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/sessions:/lab-history/sessions:rw,z
       - ${LAB_STORAGE_ROOT:?set absolute storage root}/history/control:/lab-history/control:rw,z
+      - ${LAB_STORAGE_ROOT:?set absolute storage root}/search/control:/lab-search-authority/control:ro,z
       - type: bind
         source: ${LAB_HISTORY_INPUT:-/nonexistent/btc-lab-history-unprepared.json}
         target: /lab-history/input.json

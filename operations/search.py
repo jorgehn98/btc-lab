@@ -92,6 +92,7 @@ SELECTION_REL = Path("research/selection.py")
 STATE_REL = Path("research/state.py")
 CANDIDATES_REL = Path("strategies/search/SpotCandidates.py")
 CONTROL_REL = Path("strategies/search/ControlSmaCrossBaseline.py")
+BASELINE_BASE_REL = Path("strategies/baseline/SmaCrossBaseline.py")
 EQUITY_REL = Path("market/equity.py")
 PARTITIONS_REL = Path("market/history.py")
 TRAIN_HELPER_REL = Path("market/train.py")
@@ -268,6 +269,12 @@ def _code_hashes(code_root: Path) -> dict:
     out = {}
     for key, rel in targets.items():
         out[key] = launch.file_hash(code / rel)
+    # El wrapper del control hereda esta implementacion; debe formar parte de
+    # la identidad igual que el propio wrapper.
+    baseline_base = code / BASELINE_BASE_REL
+    if not baseline_base.is_file():
+        raise ValueError(f"control baseline ausente: {BASELINE_BASE_REL}")
+    out["baseline_base_hash"] = launch.file_hash(baseline_base)
     return out
 
 
@@ -800,6 +807,290 @@ def _save_state_atomic(state_path: Path, state: dict) -> None:
     launch._atomic_replace(Path(state_path), dict(state))
 
 
+AUTHORITY_ROOT = "/lab-search-authority"
+
+
+def _contained_under(root: Path, rel: str, label: str) -> Path:
+    """Resuelve una ruta (relativa o absoluta) con contencion bajo root.
+
+    Acepta absolutas contenidas (los tests usan tmp absolutos); escapes
+    (`..` fuera de la raiz, symlinks externos) rechazan tras `resolve`,
+    siempre antes de leer.
+    """
+    if not isinstance(rel, str) or not rel:
+        raise ValueError(f"{label} ausente")
+    root_res = Path(root).resolve()
+    cand = Path(rel)
+    target = (cand if cand.is_absolute() else (root_res / cand)).resolve()
+    try:
+        target.relative_to(root_res)
+    except ValueError:
+        raise ValueError(f"{label} fuera de la raiz") from None
+    return target
+
+
+def load_authority() -> dict:
+    """Lee la autoridad canonica RO (control montado solo-lectura).
+
+    Sin montaje falla cerrado (los roles externos quedan bloqueados; TRAIN
+    nunca la necesita). Parcheable en tests via AUTHORITY_ROOT.
+    """
+    root = Path(str(AUTHORITY_ROOT))
+    path = _contained_under(
+        root, f"control/campaign-{CAMPAIGN_ID}.json", "estado autoridad")
+    try:
+        authority = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"autoridad ilegible: {exc}") from exc
+    if not isinstance(authority, dict):
+        raise ValueError("autoridad no es un objeto")
+    return authority
+
+
+def authorize_holdout(authority, role: str, grant) -> bool:
+    """Autoriza un grant contra la autoridad canonica registrada.
+
+    Exige: grant registrado IDENTICO en authority.grants[role], misma
+    campana/definicion, y para TEST consumed True + mismo test_grant +
+    candidata. La fase origen canonica es obligatoria y su SHA, estado y
+    veredicto deben autorizar exactamente la promocion. Un dict con forma
+    valida pero SIN registro rechaza siempre:
+    `market.authorize_partition` puro nunca es autoridad.
+    """
+    if role not in ("validation", "test"):
+        raise ValueError(f"grant solo para validation/test, no {role!r}")
+    if not isinstance(authority, dict):
+        raise ValueError("autoridad debe ser dict")
+    if not isinstance(grant, dict):
+        raise ValueError("grant debe ser dict")
+    if "force" in grant:
+        raise ValueError("campo 'force' prohibido en grant")
+    for key in ("campaign_id", "grant_id", "definition_hash"):
+        value = grant.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"grant sin {key} valido")
+    if str(grant.get("campaign_id")) != str(authority.get("campaign_id")):
+        raise ValueError("grant de otra campana")
+    if str(grant.get("definition_hash")) != str(authority.get("definition_hash")):
+        raise ValueError("grant con definition_hash distinto (inmutable)")
+    stored = (authority.get("grants") or {}).get(role)
+    if not isinstance(stored, dict) or stored != dict(grant):
+        raise ValueError(f"grant no registrado como vigente para {role}")
+    if role == "validation":
+        frozen = sorted(str(v) for v in (authority.get("validation_ids") or []))
+        if sorted(str(v) for v in (grant.get("validation_ids") or [])) != frozen:
+            raise ValueError("grant fuera de validation_ids congelados")
+    else:
+        if authority.get("test_consumed") is not True:
+            raise ValueError("TEST sin consumo registrado")
+        tg = authority.get("test_grant") or {}
+        if (tg.get("candidate_id") != grant.get("candidate_id")
+                or tg.get("grant_id") != grant.get("grant_id")):
+            raise ValueError("grant TEST diverge de la reserva")
+        if "test_candidate" in authority:
+            if str(authority.get("test_candidate")) != str(grant.get("candidate_id")):
+                raise ValueError("grant TEST fuera de candidata reservada")
+    source = "finalists" if role == "validation" else "validation"
+    report_key = ("train_report_sha256" if role == "validation"
+                  else "validation_report_sha256")
+    entry = (authority.get("phase_reports") or {}).get(source)
+    if not isinstance(entry, dict):
+        raise ValueError(f"fase origen {source} sin referencia canonica")
+    if entry.get("sha256") != grant.get(report_key):
+        raise ValueError(f"grant cita report {source} distinto al registrado")
+    if entry.get("status") != "SUCCEEDED":
+        raise ValueError(f"report {source} registrado no SUCCEEDED")
+    expected_verdict = "TOP3" if role == "validation" else "CANDIDATE"
+    if entry.get("verdict") != expected_verdict:
+        raise ValueError(
+            f"report {source} no autoriza {role}: {entry.get('verdict')!r}")
+    return True
+
+
+def _expected_verdicts(phase: str) -> tuple:
+    if phase == "screen":
+        return ("TOP9", "NO_CANDIDATE")
+    if phase == "finalists":
+        return ("TOP3", "NO_CANDIDATE")
+    if phase == "validation":
+        return ("CANDIDATE", "NO_CANDIDATE")
+    if phase == "test":
+        return ("PASS", "FAIL", "INCONCLUSIVE")
+    raise ValueError(f"fase desconocida: {phase!r}")
+
+
+_POSITIVE_VERDICTS = {"screen": ("TOP9",), "finalists": ("TOP3",),
+                      "validation": ("CANDIDATE",), "test": ("PASS",)}
+
+
+def _resume_completed(phase: str, state: dict):
+    """Artefacto autoritativo de una fase ya finalizada (sin re-ejecutar).
+
+    Solo si state.phase_reports[phase] existe con status SUCCEEDED: resuelve
+    la referencia canonica (path+SHA+schema+IDs) y retorna (payload, rc),
+    con rc 0 en veredictos positivos y 1 en terminales negativos. Sin
+    entrada (o entrada no SUCCEEDED) lanza ValueError: ejecutar normal con
+    cache (un crash entre report y estado nunca adopta huerfanos por scan).
+    """
+    refs = state.get("phase_reports") or {}
+    ref = refs.get(phase)
+    if not isinstance(ref, dict) or ref.get("status") != "SUCCEEDED":
+        raise ValueError(f"fase {phase} sin finalizacion SUCCEEDED registrada")
+    payload, _sha = resolve_phase_report(state, phase)
+    verdict = str(payload.get("verdict"))
+    if phase == "test" and verdict == "PASS":
+        if state.get("paper_ready") is not True:
+            raise ValueError("TEST PASS sin publicacion paper_ready")
+        candidate = str(payload.get("candidate_id") or "")
+        grant_id = str(payload.get("grant_id") or "")
+        evidence_sha = str((payload.get("lineage") or {}).get(
+            "evidence_sha256") or "")
+        if not candidate or not grant_id or not evidence_sha:
+            raise ValueError("TEST PASS sin identidad de publicacion")
+        control = Path(CONTAINER_SEARCH) / "control"
+        evidence_path = control / f"test-evidence-{candidate}-{grant_id[:8]}.json"
+        bundle_path = control / f"paper-bundle-{candidate}-{grant_id[:8]}.json"
+        if _sha256_file(evidence_path) != evidence_sha:
+            raise ValueError("evidencia TEST ausente o alterada")
+        try:
+            bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"bundle paper ilegible: {exc}") from exc
+        if (not isinstance(bundle, dict)
+                or bundle.get("kind") != PAPER_BUNDLE_KIND
+                or bundle.get("status") != "SEALED"
+                or str(bundle.get("candidate_id") or "") != candidate
+                or str((bundle.get("grant") or {}).get("grant_id") or "") != grant_id
+                or str((bundle.get("reports") or {}).get("evidence_sha256") or "")
+                != evidence_sha):
+            raise ValueError("bundle paper no coincide con TEST PASS")
+    shown = str(Path(CONTAINER_SEARCH) / str((state["phase_reports"][phase])["path"]))
+    return payload, shown, (0 if verdict in _POSITIVE_VERDICTS[phase] else 1)
+
+
+def _check_resolved_ids(phase: str, payload: dict, state: dict) -> None:
+    """Consistencia semantica elegidos <=> congelados del estado."""
+    if phase == "screen":
+        frozen = state.get("train_ids")
+        if not frozen:
+            raise ValueError("screen resuelto sin top9 congelado")
+        if sorted(str(v) for v in (payload.get("top9") or [])) != sorted(
+                str(v) for v in frozen):
+            raise ValueError("top9 resuelto difiere de congelados (IDs stale)")
+    elif phase == "finalists":
+        frozen = state.get("validation_ids")
+        if not frozen:
+            raise ValueError("finalists resuelto sin validation_ids congelados")
+        if sorted(str(v) for v in (payload.get("validation_ids") or [])) != sorted(
+                str(v) for v in frozen):
+            raise ValueError("validation_ids resueltos difieren (IDs stale)")
+    elif phase == "validation":
+        if payload.get("verdict") == "CANDIDATE":
+            cand = payload.get("chosen_test_candidate")
+            if cand not in [str(v) for v in (state.get("validation_ids") or [])]:
+                raise ValueError("candidata resuelta fuera de congelados (stale)")
+    elif phase == "test":
+        if payload.get("candidate_id") != str(state.get("test_candidate") or ""):
+            raise ValueError("candidata resuelta difiere de la reservada")
+
+
+def resolve_phase_report(state: dict, phase: str, search_root=None) -> tuple[dict, str]:
+    """Resuelve el artefacto autoritativo de una fase completada.
+
+    Usa EXCLUSIVAMENTE la referencia canonica persistida en
+    state.phase_reports[phase] {path, sha256, status, verdict}: verifica
+    contencion bajo search_root, existencia, SHA exacto del fichero,
+    schema (definition/status/verdict) y consistencia de elegidos con el
+    estado. Nunca glob-scanning de positivos ni re-hash de editados:
+    un terminal NO_CANDIDATE registrado no rescata positivos antiguos, y
+    un crash entre report y estado (sin entrada) re-ejecuta en vez de
+    adoptar huerfanos. Solo SUCCEEDED es autoritativo.
+    """
+    if phase not in ("screen", "finalists", "validation", "test"):
+        raise ValueError(f"fase desconocida: {phase!r}")
+    if not isinstance(state, dict):
+        raise ValueError("state debe ser dict")
+    refs = state.get("phase_reports") or {}
+    ref = refs.get(phase)
+    if not isinstance(ref, dict):
+        raise ValueError(f"fase {phase} sin referencia canonica (no re-ejecutar "
+                         "a ciegas: falta finalizacion registrada)")
+    for key in ("path", "sha256", "status", "verdict"):
+        if not isinstance(ref.get(key), str) or not ref.get(key):
+            raise ValueError(f"referencia {phase} sin {key} valido")
+    if ref.get("status") != "SUCCEEDED":
+        raise ValueError(f"fase {phase} registrada como {ref.get('status')}: "
+                         "no autoritativa, re-ejecutar")
+    if ref.get("verdict") not in _expected_verdicts(phase):
+        raise ValueError(f"veredicto inesperado en referencia {phase}")
+    root = Path(search_root if search_root is not None else CONTAINER_SEARCH)
+    target = _contained_under(root, ref["path"], f"report {phase}")
+    try:
+        raw = target.read_bytes()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"report {phase} ilegible: {exc}") from exc
+    if _sha256_bytes(raw) != ref["sha256"]:
+        raise ValueError(f"report {phase} editado tras el sellado (SHA difiere)")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"report {phase} ilegible: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"report {phase} no es un objeto")
+    if str(payload.get("definition_hash")) != str(state.get("definition_hash")):
+        raise ValueError(f"report {phase} de otra definicion")
+    if str(payload.get("status")) != "SUCCEEDED":
+        raise ValueError(f"report {phase} no SUCCEEDED en fichero")
+    if str(payload.get("verdict")) != ref["verdict"]:
+        raise ValueError(f"report {phase} con veredicto distinto al registrado")
+    _check_resolved_ids(phase, payload, state)
+    return payload, ref["sha256"]
+
+
+def _record_phase_report(state, state_path, phase: str, session_dir,
+                         verdict: str, status: str = "SUCCEEDED") -> tuple[dict, str]:
+    """Persiste el reporte terminal + su referencia canonica, bajo lock.
+
+    Llamar con el estado fresco ya cargado bajo el lock adquirido; guarda el
+    estado atomico tras registrar. Retorna (payload, sha256) del report.
+    """
+    report_path = Path(session_dir) / "report.json"
+    try:
+        raw = report_path.read_bytes()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"report {phase} ilegible: {exc}") from exc
+    sha = _sha256_bytes(raw)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"report {phase} ilegible: {exc}") from exc
+    if str(payload.get("verdict") or "FAILED") != str(verdict):
+        raise ValueError(f"report {phase} con veredicto inesperado")
+    if str(payload.get("status")) != str(status):
+        raise ValueError(f"report {phase} con estado inesperado")
+    try:
+        rel = str(report_path.resolve().relative_to(
+            Path(CONTAINER_SEARCH).resolve()))
+    except ValueError:
+        raise ValueError(f"report {phase} fuera de la raiz de busqueda") from None
+    refs = state.get("phase_reports")
+    if not isinstance(refs, dict):
+        refs = {}
+        state["phase_reports"] = refs
+    refs[str(phase)] = {"path": rel, "sha256": sha,
+                        "status": str(status), "verdict": str(verdict)}
+    _save_state_atomic(state_path, state)
+    return payload, sha
+
+
 def _batch_names(variant_ids, batch_size=BATCH_MAX):
     ordered = sorted(str(v) for v in variant_ids)
     batches = []
@@ -934,6 +1225,83 @@ def _batch_evidence_hash(image_id, generated_sha, config_hash, code_hashes,
 
 def _sanitize_run_key(key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.\-]", "_", key)
+
+
+class _JobFail(Exception):
+    """Fallo terminal de un job nativo ya invocado (con causa registrable)."""
+
+    def __init__(self, cause: str):
+        super().__init__(cause)
+        self.cause = str(cause)
+
+
+def _output_digest(run_key: str, evidence: str, results_min: dict,
+                   zip_relpath: str, zip_sha256: str) -> dict:
+    """Digest de salida separado de la evidencia de entrada."""
+    return {
+        "zip_relpath": str(zip_relpath),
+        "zip_sha256": str(zip_sha256),
+        "payload_sha256": _sha256_bytes(_canonical({
+            "run_key": str(run_key),
+            "evidence_hash": str(evidence),
+            "results": {str(n): {
+                "profit_abs": float(v["profit_abs"]),
+                "trades_count": int(v["trades_count"]),
+                "trades": list(v.get("trades") or []),
+            } for n, v in dict(results_min).items()},
+        })),
+    }
+
+
+def _verify_cached_output(prior: dict, expected_output, run_key: str,
+                          evidence: str, names) -> dict | None:
+    """Re-verifica un exito cacheado contra el ZIP autoritativo.
+
+    Exige digest de salida esperado en el estado, ruta canonica contenida,
+    SHA del fichero, re-parseo con nombres/conteos y hash del payload
+    recalculado desde lo reparseado (nunca los datos cacheados). Retorna
+    {name: resumen} o None si manipulado/invalido (sin promocion).
+    """
+    if not isinstance(expected_output, dict):
+        return None
+    zip_rel = expected_output.get("zip_relpath")
+    zip_sha = expected_output.get("zip_sha256")
+    payload_sha = expected_output.get("payload_sha256")
+    if not zip_rel or not zip_sha or not payload_sha:
+        return None
+    try:
+        target = _contained_under(Path(CONTAINER_SEARCH), str(zip_rel), "zip cache")
+    except ValueError:
+        return None
+    if not target.is_file():
+        return None
+    try:
+        digest = launch.file_hash(target)
+    except OSError:
+        return None
+    if digest != zip_sha:
+        return None
+    from research.evaluation import parse_native_batch as _parse
+
+    parsed, perr = _parse(target, list(names))
+    if perr is not None or parsed is None:
+        return None
+    results_min = {n: {
+        "profit_abs": parsed[n]["profit_abs"],
+        "trades_count": parsed[n]["trades_count"],
+        "trades": parsed[n]["trades"],
+    } for n in names}
+    if _sha256_bytes(_canonical({
+            "run_key": str(run_key),
+            "evidence_hash": str(evidence),
+            "results": {str(n): {
+                "profit_abs": float(v["profit_abs"]),
+                "trades_count": int(v["trades_count"]),
+                "trades": list(v.get("trades") or []),
+            } for n, v in dict(results_min).items()},
+    })) != payload_sha:
+        return None
+    return results_min
 
 
 def _sha256_file(path) -> str:
@@ -1175,41 +1543,76 @@ def _prepare_phase_validation(search_input, definition_hash, code, store, contro
     validation_ids = sorted(str(v) for v in (state.get("validation_ids") or []))
     if not validation_ids:
         raise ValueError("finalists pendiente (validation_ids vacio)")
-    _frep, frep_sha = _load_finalists_report_verified(state, search_root=search_root)
-    _srep, srep_sha = _load_screen_report_verified(state, search_root=search_root)
+    _frep, _frep_sha = resolve_phase_report(state, "finalists",
+                                              search_root=search_root)
+    _srep, srep_sha = resolve_phase_report(state, "screen",
+                                           search_root=search_root)
     if str(_frep.get("screen_report_sha256") or "") != srep_sha:
         raise ValueError("nuevo screen tras finalists: re-ejecutar finalists")
     if snapshot is None:
+        registered = (state.get("grants") or {}).get("validation")
+        if isinstance(registered, dict):
+            if (sorted(str(v) for v in (registered.get("validation_ids") or []))
+                    == validation_ids
+                    and str(registered.get("train_report_sha256") or "") == _frep_sha
+                    and str(registered.get("definition_hash")) == definition_hash):
+                grant = registered
+                grant_path = control / f"validation-grant-{grant['grant_id'][:8]}.json"
+                if (not grant_path.is_file() or json.loads(
+                        grant_path.read_text(encoding="utf-8")) != grant):
+                    raise ValueError("grant registrado sin fichero canonico")
+                existing_hist = _find_history_input_by_grant(
+                    store, "validation", str(grant.get("grant_id")))
+                if existing_hist is not None:
+                    return json.dumps({"grant": str(grant_path),
+                                       "history_input": str(existing_hist),
+                                       "resumed": True}, indent=2, sort_keys=True)
+                hpath = prepare_history_with_grant(
+                    str(code), str(store), image_ref, "validation", grant,
+                    list(validation_ids), _frep_sha, definition_hash)
+                return json.dumps({"grant": str(grant_path),
+                                   "history_input": str(hpath),
+                                   "resumed": True}, indent=2, sort_keys=True)
+            raise ValueError("grant validation registrado difiere (inmutable: "
+                             "un solo vigente por rol)")
         grant = {
             "campaign_id": CAMPAIGN_ID,
             "grant_id": uuid.uuid4().hex,
             "definition_hash": definition_hash,
             "phase": "validation",
             "validation_ids": list(validation_ids),
-            "train_report_sha256": srep_sha,
+            "train_report_sha256": _frep_sha,
         }
         grant_path = control / f"validation-grant-{grant['grant_id'][:8]}.json"
         launch._atomic_create_new(grant_path, grant)
+        grants = state.get("grants")
+        if not isinstance(grants, dict):
+            grants = {}
+            state["grants"] = grants
+        grants["validation"] = dict(grant)
+        _save_state_atomic(state_path, state)
         hpath = prepare_history_with_grant(
             str(code), str(store), image_ref, "validation", grant,
-            list(validation_ids), srep_sha, definition_hash)
+            list(validation_ids), _frep_sha, definition_hash)
         return json.dumps({"grant": str(grant_path), "history_input": str(hpath)},
                           indent=2, sort_keys=True)
     grant_path, grant = _resolve_host_grant(
         control, "validation-grant-", definition_hash, validation_ids, grant_id)
+    if (state.get("grants") or {}).get("validation") != dict(grant):
+        raise ValueError("grant no registrado como vigente en el estado")
     from operations.history import verify_holdout_grant
 
     verify_holdout_grant("validation", grant, definition_hash,
-                         validation_ids, srep_sha)
-    if str(grant.get("train_report_sha256") or "") != srep_sha:
-        raise ValueError("grant con train_report_sha256 de otro screen")
+                         validation_ids, _frep_sha)
+    if str(grant.get("train_report_sha256") or "") != _frep_sha:
+        raise ValueError("grant con train_report_sha256 de otros finalists")
     live = _verify_role_snapshot_host(store, "validation", snapshot)
     binding = {
         "kind": SNAP_BIND_KIND,
         "grant_id": str(grant.get("grant_id")),
         "definition_hash": definition_hash,
         "expected_ids": list(validation_ids),
-        "train_report_sha256": srep_sha,
+        "train_report_sha256": _frep_sha,
         **live,
     }
     bind_path = control / f"validation-snapshot-{str(grant.get('grant_id'))[:8]}.json"
@@ -1235,7 +1638,8 @@ def _prepare_phase_test(search_input, definition_hash, code, store, control,
     want_ids = sorted(str(v) for v in (state.get("validation_ids") or []))
     if not want_ids:
         raise ValueError("validation pendiente (validation_ids vacio)")
-    vrep, vrep_sha = _load_validation_report_verified(state, search_root=search_root)
+    vrep, vrep_sha = resolve_phase_report(state, "validation",
+                                          search_root=search_root)
     candidate = str(vrep.get("chosen_test_candidate") or "")
     if not candidate or candidate not in want_ids:
         raise ValueError("validation sin candidata elegible verificada")
@@ -1251,6 +1655,8 @@ def _prepare_phase_test(search_input, definition_hash, code, store, control,
                 control, "test-grant-", definition_hash, [candidate], grant_id)
             if str(grant.get("validation_report_sha256") or "") != vrep_sha:
                 raise ValueError("nuevo validation tras reserva: bloque")
+            if (state.get("grants") or {}).get("test") != dict(grant):
+                raise ValueError("grant TEST no registrado como vigente")
             existing_hist = _find_history_input_by_grant(store, "test",
                                                          str(grant.get("grant_id")))
             if existing_hist is not None:
@@ -1275,6 +1681,11 @@ def _prepare_phase_test(search_input, definition_hash, code, store, control,
         state["test_grant"] = {k: grant[k] for k in (
             "campaign_id", "candidate_id", "grant_id", "definition_hash",
             "phase", "validation_report_sha256")}
+        grants = state.get("grants")
+        if not isinstance(grants, dict):
+            grants = {}
+            state["grants"] = grants
+        grants["test"] = dict(grant)
         _save_state_atomic(state_path, state)
         grant_path = control / f"test-grant-{grant['grant_id'][:8]}.json"
         launch._atomic_create_new(grant_path, grant)
@@ -1293,6 +1704,8 @@ def _prepare_phase_test(search_input, definition_hash, code, store, control,
         control, "test-grant-", definition_hash, [candidate], grant_id)
     if str(grant.get("grant_id")) != str(state.get("test_grant_id")):
         raise ValueError("grant diverge de la reserva (switch prohibido)")
+    if (state.get("grants") or {}).get("test") != dict(grant):
+        raise ValueError("grant TEST no registrado como vigente")
     if str(grant.get("validation_report_sha256") or "") != vrep_sha:
         raise ValueError("nuevo validation tras reserva: bloque")
     live = _verify_role_snapshot_host(store, "test", snapshot)
@@ -1492,12 +1905,37 @@ def _execute_native_matrix(*, phase, role, windows, fees, groups, snap_root,
         batch_payload = None
         reused = False
         if can_reuse_run(state, run_key, evidence):
-            batch_payload = _prior_batch_file(run_key, evidence)
-            reused = batch_payload is not None
-        if reused:
-            done += 1
-            succ += 1
-            _progress()
+            prior = _prior_batch_file(run_key, evidence)
+            if prior is not None:
+                expected_output = ((state.get("native_runs") or {}).get(run_key)
+                                   or {}).get("output")
+                verified = _verify_cached_output(prior, expected_output,
+                                                 run_key, evidence, names)
+                if verified is not None:
+                    batch_payload = dict(prior)
+                    batch_payload["results"] = verified
+                    reused = True
+                    done += 1
+                    succ += 1
+                    _progress()
+                else:
+                    # Cache invalida o manipulada: FAILED sin cargo (ningun
+                    # proceso invocado), sin promocion ni fallback a otro
+                    # positivo antiguo. Motivo fuera de NativeCalls.
+                    fail += 1
+                    done += 1
+                    causes["cache-invalid"] = causes.get("cache-invalid", 0) + 1
+                    batch_payload = {
+                        "run_key": run_key, "evidence_hash": evidence,
+                        "status": "FAILED", "cause": "cache-invalid",
+                        "elapsed_s": 0.0, "fee": fee,
+                        "window": {k: window[k] for k in ("year", "seg_dir", "start", "end_exclusive")},
+                        "strategies": names,
+                    }
+                    launch._atomic_create_new(batch_dir / f"{_sanitize_run_key(run_key)}.json",
+                                              batch_payload)
+                    _progress()
+                    continue
         if batch_payload is None:
             remaining = float(state.get("budget_limit", BUDGET_SECONDS)) - float(state.get("consumed", 0))
             if remaining <= 0:
@@ -1554,75 +1992,98 @@ def _execute_native_matrix(*, phase, role, windows, fees, groups, snap_root,
                 if causes[cause] >= SAME_CAUSE_CAP:
                     raise ValueError(f"misma causa {cause} x{SAME_CAUSE_CAP}: stop")
                 continue
-            zips = sorted(export_dir.glob("*.zip"))
-            if len(zips) != 1:
-                cause = f"zip:{'0' if not zips else 'multi'}"
+            # Post-nativo con cargo unico garantizado: UNA invocacion real
+            # produce EXACTAMENTE un intento (aunque parse/open fallen con
+            # OSError); el budget jamas se resetea.
+            charged = False
+
+            def _charge(status, output=None):
+                nonlocal charged
+                if charged:
+                    raise AssertionError("doble cargo de intento nativo")
+                charged = True
                 try:
-                    record_attempt(state, run_key, float(elapsed), "FAILED", str(evidence))
+                    record_attempt(state, run_key, float(elapsed), status,
+                                   str(evidence), output=output)
                 finally:
                     _save_state_atomic(state_path, state)
-                causes[cause] = causes.get(cause, 0) + 1
-                fail += 1
-                done += 1
-                batch_payload = {
+
+            def _fail_job(cause):
+                _charge("FAILED")
+                causes[str(cause)] = causes.get(str(cause), 0) + 1
+                payload = {
                     "run_key": run_key, "evidence_hash": evidence,
                     "status": "FAILED", "cause": cause,
                     "elapsed_s": float(elapsed), "fee": fee,
                     "window": {k: window[k] for k in ("year", "seg_dir", "start", "end_exclusive")},
                     "strategies": names, "argv": argv,
                 }
-                launch._atomic_create_new(batch_dir / f"{job_tag}.json", batch_payload)
-                _progress()
-                continue
-            parsed, perr = _parse(zips[0], names)
-            if perr is not None or parsed is None:
-                raw_err = str(perr or "schema")
-                # El parse exige len(trades)==total_trades con prefijo
-                # estable: se registra como causa propia, no como parse.
-                cause = raw_err[:60] if raw_err.startswith("count:") else f"parse:{raw_err[:60]}"
-                try:
-                    record_attempt(state, run_key, float(elapsed), "FAILED", str(evidence))
-                finally:
-                    _save_state_atomic(state_path, state)
-                causes[cause] = causes.get(cause, 0) + 1
-                fail += 1
-                done += 1
-                batch_payload = {
-                    "run_key": run_key, "evidence_hash": evidence,
-                    "status": "FAILED", "cause": cause,
-                    "elapsed_s": float(elapsed), "fee": fee,
-                    "window": {k: window[k] for k in ("year", "seg_dir", "start", "end_exclusive")},
-                    "strategies": names, "argv": argv,
-                    "zip": zips[0].name,
-                }
-                launch._atomic_create_new(batch_dir / f"{job_tag}.json", batch_payload)
-                _progress()
-                continue
-            # Conteo len(trades)==total_trades ya exigido por parse_native_batch
-            # (causa count:); sin segundo gate duplicado.
+                if zip_name is not None:
+                    payload["zip"] = zip_name
+                launch._atomic_create_new(batch_dir / f"{job_tag}.json", payload)
+                return payload
+
+            zip_name = None
             try:
-                record_attempt(state, run_key, float(elapsed), "SUCCEEDED", str(evidence))
-            finally:
-                _save_state_atomic(state_path, state)
-            batch_payload = {
-                "run_key": run_key, "evidence_hash": evidence,
-                "status": "SUCCEEDED", "elapsed_s": float(elapsed),
-                "fee": fee,
-                "window": {k: window[k] for k in ("year", "seg_dir", "start", "end_exclusive")},
-                "strategies": names, "argv": argv,
-                "zip": zips[0].name,
-                "zip_sha256": launch.file_hash(zips[0]),
-                "results": {n: {
+                zips = sorted(export_dir.glob("*.zip"))
+                if len(zips) != 1:
+                    raise _JobFail(f"zip:{'0' if not zips else 'multi'}")
+                zip_name = zips[0].name
+                parsed, perr = _parse(zips[0], names)
+                if perr is not None or parsed is None:
+                    raw_err = str(perr or "schema")
+                    # Conteo len==total_trades con prefijo estable del parse:
+                    # causa propia, no generica de parse.
+                    raise _JobFail(raw_err[:60] if raw_err.startswith("count:")
+                                   else f"parse:{raw_err[:60]}")
+                try:
+                    zip_rel = str((export_dir / zips[0].name).resolve().relative_to(
+                        Path(CONTAINER_SEARCH).resolve()))
+                except ValueError:
+                    raise _JobFail("output:path") from None
+                try:
+                    zip_sha = launch.file_hash(export_dir / zips[0].name)
+                except OSError as exc:
+                    raise _JobFail(f"output:{type(exc).__name__}") from exc
+                results_min = {n: {
                     "profit_abs": parsed[n]["profit_abs"],
                     "trades_count": parsed[n]["trades_count"],
                     "trades": parsed[n]["trades"],
-                } for n in names},
-                "reused": False,
-            }
-            launch._atomic_create_new(batch_dir / f"{job_tag}.json", batch_payload)
-            succ += 1
+                } for n in names}
+                output = _output_digest(run_key, str(evidence), results_min,
+                                        zip_rel, zip_sha)
+                batch_payload = {
+                    "run_key": run_key, "evidence_hash": evidence,
+                    "status": "SUCCEEDED", "elapsed_s": float(elapsed),
+                    "fee": fee,
+                    "window": {k: window[k] for k in ("year", "seg_dir", "start", "end_exclusive")},
+                    "strategies": names, "argv": argv,
+                    "zip": zips[0].name,
+                    "zip_sha256": zip_sha,
+                    "results": results_min,
+                    "reused": False,
+                    "output": dict(output),
+                }
+                launch._atomic_create_new(batch_dir / f"{job_tag}.json", batch_payload)
+                _charge("SUCCEEDED", output)
+            except _JobFail as exc:
+                batch_payload = _fail_job(exc.cause)
+            except OSError as exc:
+                if charged:
+                    raise
+                batch_payload = _fail_job(f"output:{type(exc).__name__}")
+            fail += 1 if batch_payload.get("status") == "FAILED" else 0
             done += 1
+            if batch_payload.get("status") == "SUCCEEDED":
+                succ += 1
+            else:
+                assert batch_payload.get("cause") is not None
             _progress()
+            if batch_payload.get("status") == "FAILED":
+                cause = batch_payload.get("cause")
+                if causes.get(cause, 0) >= SAME_CAUSE_CAP:
+                    raise ValueError(f"misma causa {cause} x{SAME_CAUSE_CAP}: stop")
+                continue
         if batch_payload.get("status") != "SUCCEEDED":
             continue
         for nname, res in (batch_payload.get("results") or {}).items():
@@ -2176,6 +2637,15 @@ def cmd_screen() -> int:
                 print(f"screen: fase no autorizada / estado no valido: {exc}",
                       file=sys.stderr)
                 return 2
+            refs = state.get("phase_reports") or {}
+            if isinstance(refs.get("screen"), dict) and refs["screen"].get("status") == "SUCCEEDED":
+                try:
+                    _resumed, _shown, _rc = _resume_completed("screen", state)
+                except (FileNotFoundError, ValueError, OSError) as exc:
+                    print(f"screen: artefacto registrado invalido: {exc}", file=sys.stderr)
+                    return 1
+                print(_shown)
+                return _rc
             sessions = Path(CONTAINER_SEARCH) / "sessions"
             sessions.mkdir(parents=True, exist_ok=True)
             session_dir = sessions / f"screen-{_slug()}"
@@ -2245,6 +2715,8 @@ def cmd_screen() -> int:
                     "succeeded": succ, "failed": fail, "total": total,
                     "excluded_coverage_years": excluded,
                 })
+                _record_phase_report(state, state_path, "screen", session_dir,
+                                     "FAILED", status="FAILED")
                 print(str(session_dir / "report.json"))
                 return 1
             # Agregacion por ano honesta (cero real g0, faltante nonvalid).
@@ -2267,6 +2739,8 @@ def cmd_screen() -> int:
                     "excluded_coverage_years": excluded,
                     "consumed": state.get("consumed"),
                 })
+                _record_phase_report(state, state_path, "screen", session_dir,
+                                     "NO_CANDIDATE")
                 print(str(session_dir / "report.json"))
                 # Terminal NO_CANDIDATE: sin freeze vacio (la API exige 1..9);
                 # el estado queda REGISTERED sin holdouts abiertos.
@@ -2294,6 +2768,7 @@ def cmd_screen() -> int:
                     "definition_hash": manifest_in.get("definition_hash"),
                 },
             })
+            _record_phase_report(state, state_path, "screen", session_dir, "TOP9")
             print(str(session_dir / "report.json"))
             return 0
     except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
@@ -2321,37 +2796,45 @@ def cmd_screen() -> int:
 def _control_coverage(results, windows, fees, seg_data_root):
     """Ledger+reconcile del control por ventana (contexto equitativo).
 
-    Retorna conteo ok/short. Rango/reconcile erroneos lanzan (FAIL de fase).
+    El control ausente o con ledger erroneo FALLA la fase con error
+    etiquetado (ventana/fee): nunca short silencioso. Las exclusiones
+    genuinas de cobertura se declaran antes de los jobs (plan_windows),
+    no como catchall de errores matematicos.
     """
     from research.evaluation import check_trades_in_window
 
-    ok = short = 0
+    ok = 0
     for window in windows:
         for fee in fees:
+            label = (f"control y{window['year']} {window['seg_dir']} "
+                     f"fee {float(fee):.4f}")
             key = (int(window["year"]), str(window["seg_dir"]), float(fee),
                    CONTROL_STRATEGY)
             res = results.get(key)
             if res is None:
-                continue
+                raise ValueError(f"{label}: sin resultado nativo (FAIL de fase)")
             trades = list(res.get("trades") or [])
-            check_trades_in_window(trades, window["start"], window["end_exclusive"])
+            try:
+                check_trades_in_window(trades, window["start"], window["end_exclusive"])
+            except ValueError as exc:
+                raise ValueError(f"{label} rango: {exc}") from exc
             try:
                 prices5, _f1, _o, _l = _load_prices_for_window(
                     str(Path(seg_data_root) / str(window["seg_dir"])), window)
+            except ValueError as exc:
+                raise ValueError(f"{label} precios: {exc}") from exc
+            try:
                 _c, _s = _ledger_for_trades(
                     prices5, trades, window["start"], window["end_exclusive"])
-            except ValueError:
-                short += 1
-                continue
+            except ValueError as exc:
+                raise ValueError(f"{label} ledger: {exc}") from exc
             from market.equity import reconcile_final_ledger as _rec
 
             _r = _rec(_s, float(res["profit_abs"]), 10000.0, 0.01)
             if not _r.get("ok"):
-                raise ValueError(
-                    f"reconcile control y{window['year']} {window['seg_dir']}: "
-                    f"diff {_r.get('diff')}")
+                raise ValueError(f"reconcile {label}: diff {_r.get('diff')}")
             ok += 1
-    return {"ok": ok, "short": short}
+    return {"ok": ok, "short": 0}
 
 
 def _candidate_episodes(results, windows, fees, targets, by_id, seg_data_root):
@@ -2425,9 +2908,18 @@ def cmd_finalists() -> int:
                 if str(vid) not in by_id:
                     print(f"finalists: train_id desconocida: {vid!r}", file=sys.stderr)
                     return 1
+            refs = state.get("phase_reports") or {}
+            if isinstance(refs.get("finalists"), dict) and refs["finalists"].get("status") == "SUCCEEDED":
+                try:
+                    _resumed, _shown, _rc = _resume_completed("finalists", state)
+                except (FileNotFoundError, ValueError, OSError) as exc:
+                    print(f"finalists: artefacto registrado invalido: {exc}", file=sys.stderr)
+                    return 1
+                print(_shown)
+                return _rc
             try:
-                screen_report, screen_sha = _load_screen_report_verified(state)
-            except ValueError as exc:
+                screen_report, screen_sha = resolve_phase_report(state, "screen")
+            except (FileNotFoundError, ValueError, OSError) as exc:
                 print(f"finalists: report screen no verificado: {exc}", file=sys.stderr)
                 return 2
             screen_records = list(screen_report.get("records") or [])
@@ -2545,6 +3037,8 @@ def cmd_finalists() -> int:
                     "excluded_coverage_years": excluded,
                     "consumed": state.get("consumed"),
                 })
+                _record_phase_report(state, state_path, "finalists", session_dir,
+                                     "NO_CANDIDATE")
                 print(str(session_dir / "report.json"))
                 return 1
             if state.get("validation_ids") is None:
@@ -2571,6 +3065,7 @@ def cmd_finalists() -> int:
                     "screen_report_sha256": screen_sha,
                 },
             })
+            _record_phase_report(state, state_path, "finalists", session_dir, "TOP3")
             print(str(session_dir / "report.json"))
             return 0
     except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
@@ -2606,11 +3101,12 @@ def _resolve_role_binding(role: str, state: dict) -> tuple[dict, dict]:
         expected_ids = sorted(str(v) for v in (state.get("validation_ids") or []))
         if not expected_ids:
             raise ValueError("sin validation_ids congelados")
-        # El grant de validation encadena el report SCREEN (origen de los 9);
-        # los ids congelados por finalists ya estan en el estado; se exige
-        # ademas que exista report finalists/TOP3 verificado con esos ids.
-        frep, frep_sha = _load_screen_report_verified(state)
-        _load_finalists_report_verified(state)
+        # El grant encadena directamente finalists/TOP3. La ascendencia hasta
+        # SCREEN se comprueba dentro del propio reporte finalists.
+        frep, frep_sha = resolve_phase_report(state, "finalists")
+        _screen, screen_sha = resolve_phase_report(state, "screen")
+        if str(frep.get("screen_report_sha256") or "") != screen_sha:
+            raise ValueError("finalists no encadena el SCREEN canonico")
         prefix, grant_prefix = "validation-snapshot-", "validation-grant-"
         report_key = "train_report_sha256"
     elif role == "test":
@@ -2618,7 +3114,7 @@ def _resolve_role_binding(role: str, state: dict) -> tuple[dict, dict]:
         if not cand:
             raise ValueError("sin test_candidate reservada")
         expected_ids = [cand]
-        frep, frep_sha = _load_validation_report_verified(state)
+        frep, frep_sha = resolve_phase_report(state, "validation")
         prefix, grant_prefix = "test-snapshot-", "test-grant-"
         report_key = "validation_report_sha256"
     else:
@@ -2740,6 +3236,15 @@ def cmd_validation() -> int:
             except (FileNotFoundError, ValueError, OSError) as exc:
                 print(f"validation: snapshot no valido: {exc}", file=sys.stderr)
                 return 2
+            refs = state.get("phase_reports") or {}
+            if isinstance(refs.get("validation"), dict) and refs["validation"].get("status") == "SUCCEEDED":
+                try:
+                    _resumed, _shown, _rc = _resume_completed("validation", state)
+                except (FileNotFoundError, ValueError, OSError) as exc:
+                    print(f"validation: artefacto registrado invalido: {exc}", file=sys.stderr)
+                    return 1
+                print(_shown)
+                return _rc
             sessions = Path(CONTAINER_SEARCH) / "sessions"
             sessions.mkdir(parents=True, exist_ok=True)
             session_dir = sessions / f"validation-{_slug()}"
@@ -2812,6 +3317,8 @@ def cmd_validation() -> int:
                     "excluded_coverage_years": excluded,
                     "consumed": state.get("consumed"),
                 })
+                _record_phase_report(state, state_path, "validation", session_dir,
+                                     "NO_CANDIDATE")
                 print(str(session_dir / "report.json"))
                 return 1
             launch._atomic_replace(session_dir / "report.json", {
@@ -2832,6 +3339,8 @@ def cmd_validation() -> int:
                     "snapshot_manifest_sha256": binding.get("manifest_sha256"),
                 },
             })
+            _record_phase_report(state, state_path, "validation", session_dir,
+                                 "CANDIDATE")
             print(str(session_dir / "report.json"))
             return 0
     except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
@@ -2856,8 +3365,69 @@ def cmd_validation() -> int:
         return 1
 
 
+TEST_EVIDENCE_KIND = "btc-lab-test-evidence"
+
+
+def _write_test_evidence(*, candidate, variant, manifest_in, grant,
+                         snapshot_ref_test, validation_sha, finalists_sha,
+                         economics, records):
+    """Evidencia cientifica inmutable del PASS (separada del reporte).
+
+    Solo se escribe con economia PASS + tecnica exacta True. Contenido
+    determinista (sin timestamps ni sesion) para igualdad idempotente.
+    Retorna (control_path, sha256).
+    """
+    evidence = {
+        "kind": TEST_EVIDENCE_KIND,
+        "candidate_id": str(candidate),
+        "class_name": str(variant.get("class_name")),
+        "params": dict(variant.get("params") or {}),
+        "stop": float(variant.get("stop")),
+        "risk_profile": str(variant.get("risk_profile")),
+        "campaign_id": CAMPAIGN_ID,
+        "definition_hash": manifest_in.get("definition_hash"),
+        "image_ref": manifest_in.get("image_ref"),
+        "image_id": manifest_in.get("image_id"),
+        "config_hash": manifest_in.get("config_hash"),
+        "generated_source_sha256": manifest_in.get("generated_source_sha256"),
+        "code_hashes": {
+            "search_hash": manifest_in.get("search_hash"),
+            "evaluation_hash": manifest_in.get("evaluation_hash"),
+            "campaign_hash": manifest_in.get("campaign_hash"),
+            "selection_hash": manifest_in.get("selection_hash"),
+            "state_hash": manifest_in.get("state_hash"),
+            "candidates_hash": manifest_in.get("candidates_hash"),
+            "control_hash": manifest_in.get("control_hash"),
+            "equity_hash": manifest_in.get("equity_hash"),
+        },
+        "snapshot_test_ref": dict(snapshot_ref_test),
+        "grant": {k: grant.get(k) for k in (
+            "campaign_id", "candidate_id", "grant_id", "definition_hash",
+            "phase", "validation_report_sha256") if k in grant},
+        "economics": dict(economics),
+        "technical_bias_pass": True,
+        "records": [dict(r) for r in (records or [])],
+        "reports": {
+            "validation_sha256": validation_sha,
+            "finalists_sha256": finalists_sha,
+        },
+    }
+    control_path = (Path(CONTAINER_SEARCH) / "control"
+                    / f"test-evidence-{candidate}-{str(grant.get('grant_id') or '')[:8]}.json")
+    if control_path.is_file():
+        try:
+            prev = json.loads(control_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"evidencia existente ilegible: {exc}") from exc
+        if prev != evidence:
+            raise ValueError("evidencia existente difiere (inmutable, sin overwrite)")
+    else:
+        launch._atomic_create_new(control_path, evidence)
+    return control_path, _sha256_file(control_path)
+
+
 def _write_paper_bundle(*, session_dir, candidate, variant, manifest_in,
-                        state, grant, snapshot_ref_test, test_sha,
+                        state, grant, snapshot_ref_test, evidence_sha,
                         validation_sha, finalists_sha, economics):
     code_hashes_now = {
         "search_hash": manifest_in.get("search_hash"),
@@ -2890,7 +3460,7 @@ def _write_paper_bundle(*, session_dir, candidate, variant, manifest_in,
             "phase", "validation_report_sha256") if k in grant},
         "economics": dict(economics),
         "reports": {
-            "test_sha256": test_sha,
+            "evidence_sha256": evidence_sha,
             "validation_sha256": validation_sha,
             "finalists_sha256": finalists_sha,
         },
@@ -2900,46 +3470,34 @@ def _write_paper_bundle(*, session_dir, candidate, variant, manifest_in,
             "note": ("DB y monitor propios, separados del baseline; "
                      "activacion solo por coordinator, sin timer ni arranque aqui"),
         },
-        "created_at": _utcnow_iso(),
     }
+    control = Path(CONTAINER_SEARCH) / "control"
+    for prev_path in sorted(control.glob("paper-bundle-*.json")):
+        try:
+            prev = json.loads(prev_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"bundle publicado ilegible ({prev_path.name}): {exc}") from exc
+        if not isinstance(prev, dict):
+            raise ValueError(f"bundle publicado invalido: {prev_path.name}")
+        if str(prev.get("candidate_id") or "") != str(candidate):
+            raise ValueError(
+                f"bundle publicado para otra candidata ({prev_path.name}): "
+                "overwrite prohibido")
     session_path = Path(session_dir) / "paper-bundle.json"
     launch._atomic_create_new(session_path, bundle)
-    control_path = (Path(CONTAINER_SEARCH) / "control"
+    control_path = (control
                     / f"paper-bundle-{candidate}-{str(grant.get('grant_id') or '')[:8]}.json")
     if control_path.is_file():
         try:
             prev = json.loads(control_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise ValueError(f"bundle existente ilegible: {exc}") from exc
-        if not _bundle_frozen_equal(prev, bundle):
-            raise ValueError("bundle existente difiere en contenido congelado "
-                             "(inmutable, sin overwrite)")
+        if prev != bundle:
+            raise ValueError("bundle existente difiere (inmutable, sin overwrite)")
     else:
         launch._atomic_create_new(control_path, bundle)
     return session_path, control_path
-
-
-def _bundle_frozen_equal(prev: dict, new: dict) -> bool:
-    """Igualdad del bundle salvo sello de sesion (test_sha/created_at).
-
-    El resume con cache exacta re-emite el mismo bundle sellado desde otra
-    sesion: los campos congelados (candidata, hashes, grant, snapshot,
-    economia) deben coincidir; el sha del report de sesion varia por
-    construccion y no invalida el sellado.
-    """
-    if not isinstance(prev, dict) or not isinstance(new, dict):
-        return False
-    for key in ("kind", "status", "candidate_id", "class_name", "params",
-                "stop", "risk_profile", "campaign_id", "definition_hash",
-                "image_ref", "image_id", "config_hash",
-                "generated_source_sha256", "code_hashes", "snapshot_test_ref",
-                "grant", "economics", "runtime"):
-        if prev.get(key) != new.get(key):
-            return False
-    for key in ("validation_sha256", "finalists_sha256"):
-        if (prev.get("reports") or {}).get(key) != (new.get("reports") or {}).get(key):
-            return False
-    return True
 
 
 def cmd_test() -> int:
@@ -3017,12 +3575,22 @@ def cmd_test() -> int:
                 print(f"test: snapshot no valido: {exc}", file=sys.stderr)
                 return 2
             try:
-                _frep, frep_sha = _load_finalists_report_verified(state)
-            except ValueError as exc:
+                _frep, frep_sha = resolve_phase_report(state, "finalists")
+            except (FileNotFoundError, ValueError, OSError) as exc:
                 print(f"test: report finalists no verificado: {exc}", file=sys.stderr)
                 return 2
             bias_map = _frep.get("bias_verdicts") or {}
-            technical = bias_map.get(candidate) is True
+            # Puerta tecnica exacta: solo el bool verificado True activa.
+            tech_ok = bias_map.get(candidate) is True
+            refs = state.get("phase_reports") or {}
+            if isinstance(refs.get("test"), dict) and refs["test"].get("status") == "SUCCEEDED":
+                try:
+                    _resumed, _shown, _rc = _resume_completed("test", state)
+                except (FileNotFoundError, ValueError, OSError) as exc:
+                    print(f"test: artefacto registrado invalido: {exc}", file=sys.stderr)
+                    return 1
+                print(_shown)
+                return _rc
             sessions = Path(CONTAINER_SEARCH) / "sessions"
             sessions.mkdir(parents=True, exist_ok=True)
             session_dir = sessions / f"test-{_slug()}"
@@ -3084,25 +3652,33 @@ def cmd_test() -> int:
             records = _aggregate_role_records(
                 "test", episodes, windows, list(FEES_ALL), {candidate: by_id[candidate]})
             economics = test_verdict(records, candidate)
-            final = "PASS" if (economics.get("verdict") == "PASS" and technical) else economics.get("verdict")
+            if economics.get("verdict") == "PASS" and tech_ok:
+                final = "PASS"
+            elif economics.get("verdict") == "PASS":
+                # Economia PASS pero tecnica no exacta: NONPASS terminal
+                # (nunca se hereda el veredicto economico).
+                final = "FAIL"
+            else:
+                final = economics.get("verdict")
             if final != "PASS":
                 reasons = list(economics.get("reasons") or [])
-                if not technical:
+                if not tech_ok:
                     reasons = reasons + ["tecnica: bias no PASS en finalists"]
                 launch._atomic_replace(session_dir / "report.json", {
                     **base_report, "status": "SUCCEEDED",
                     "finished_at": _utcnow_iso(),
                     "verdict": final,
                     "economics": dict(economics),
-                    "technical_bias_pass": bool(technical),
+                    "technical_bias_pass": tech_ok,
                     "reasons": reasons,
                     "control_coverage": control_cov,
                     "excluded_coverage_years": excluded,
                     "consumed": state.get("consumed"),
                 })
+                _record_phase_report(state, state_path, "test", session_dir, final)
                 print(str(session_dir / "report.json"))
                 return 1
-            _vrep, vrep_sha = _load_validation_report_verified(state)
+            _vrep, vrep_sha = resolve_phase_report(state, "validation")
             snapshot_ref_test = {
                 "manifest": str(binding.get("manifest")),
                 "manifest_sha256": str(binding.get("manifest_sha256")),
@@ -3113,15 +3689,49 @@ def cmd_test() -> int:
                 "range_start": str(binding.get("range_start")),
                 "range_end": str(binding.get("range_end")),
             }
-            test_payload = {
-                "economics": dict(economics), "technical_bias_pass": True,
-                "records": len(records),
-            }
+            # Evidencia cientifica inmutable y separada del reporte
+            # operacional (rompe el ciclo de hash): solo existe con
+            # economia PASS + tecnica exacta True.
+            _evidence_path, evidence_sha = _write_test_evidence(
+                candidate=candidate, variant=by_id[candidate],
+                manifest_in=manifest_in, grant=grant,
+                snapshot_ref_test=snapshot_ref_test,
+                validation_sha=vrep_sha, finalists_sha=frep_sha,
+                economics=economics, records=records)
+            try:
+                _write_paper_bundle(
+                    session_dir=session_dir, candidate=candidate,
+                    variant=by_id[candidate], manifest_in=manifest_in,
+                    state=state, grant=grant, snapshot_ref_test=snapshot_ref_test,
+                    evidence_sha=evidence_sha, validation_sha=vrep_sha,
+                    finalists_sha=frep_sha, economics=economics)
+            except (ValueError, OSError, RuntimeError) as exc:
+                # Fallo de publicacion: reporte FAILED, paper_ready False y
+                # estado no listo aunque la economia sea PASS. Sin PASS falso.
+                state["paper_ready"] = False
+                launch._atomic_replace(session_dir / "report.json", {
+                    **base_report, "status": "FAILED",
+                    "finished_at": _utcnow_iso(),
+                    "verdict": "FAILED",
+                    "economics": dict(economics),
+                    "technical_bias_pass": tech_ok,
+                    "publication_error": f"{type(exc).__name__}: {exc}",
+                    "evidence_sha256": evidence_sha,
+                    "consumed": state.get("consumed"),
+                })
+                _record_phase_report(state, state_path, "test", session_dir,
+                                     "FAILED", status="FAILED")
+                print(str(session_dir / "report.json"))
+                print(f"test: publicacion FAILED {type(exc).__name__}: {exc}",
+                      file=sys.stderr)
+                return 1
             launch._atomic_replace(session_dir / "report.json", {
                 **base_report, "status": "SUCCEEDED",
                 "finished_at": _utcnow_iso(),
                 "verdict": "PASS",
-                **test_payload,
+                "economics": dict(economics),
+                "technical_bias_pass": tech_ok,
+                "records": len(records),
                 "control_coverage": control_cov,
                 "excluded_coverage_years": excluded,
                 "consumed": state.get("consumed"),
@@ -3132,15 +3742,11 @@ def cmd_test() -> int:
                     "definition_hash": manifest_in.get("definition_hash"),
                     "grant_id": grant_id,
                     "snapshot_manifest_sha256": binding.get("manifest_sha256"),
+                    "evidence_sha256": evidence_sha,
                 },
             })
-            test_sha = _sha256_file(session_dir / "report.json")
-            _write_paper_bundle(
-                session_dir=session_dir, candidate=candidate,
-                variant=by_id[candidate], manifest_in=manifest_in,
-                state=state, grant=grant, snapshot_ref_test=snapshot_ref_test,
-                test_sha=test_sha, validation_sha=vrep_sha,
-                finalists_sha=frep_sha, economics=economics)
+            state["paper_ready"] = True
+            _record_phase_report(state, state_path, "test", session_dir, "PASS")
             print(str(session_dir / "report.json"))
             return 0
     except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:

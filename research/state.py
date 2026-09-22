@@ -49,6 +49,9 @@ def new_state(campaign_id, definition_hash):
         "test_grant_id": None,
         "test_grant": None,
         "test_consumed": False,
+        "grants": {},
+        "phase_reports": {},
+        "paper_ready": False,
     }
 
 
@@ -68,8 +71,11 @@ def _validate_attempt_args(state, run_key, elapsed_seconds, status, evidence_has
             raise ValueError(f"state sin {key}")
 
 
-def record_attempt(state, run_key, elapsed_seconds, status, evidence_hash):
+def record_attempt(state, run_key, elapsed_seconds, status, evidence_hash,
+                   output=None):
     _validate_attempt_args(state, run_key, elapsed_seconds, status, evidence_hash)
+    if output is not None and not isinstance(output, dict):
+        raise ValueError("output debe ser dict o None")
     elapsed = float(elapsed_seconds)
     entry = {
         "run_key": str(run_key),
@@ -77,6 +83,8 @@ def record_attempt(state, run_key, elapsed_seconds, status, evidence_hash):
         "status": str(status),
         "evidence_hash": str(evidence_hash),
     }
+    if output is not None:
+        entry["output"] = dict(output)
     # Registra consumo e historial antes de decidir tope: no se descarta
     # tiempo gastado; el llamante persiste aunque se supere el presupuesto.
     if not isinstance(state.get("native_runs"), dict):

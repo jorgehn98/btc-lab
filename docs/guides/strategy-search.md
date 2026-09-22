@@ -109,7 +109,7 @@ Los intentos y reportes quedan en `search/sessions/`; un fallo técnico no se
 oculta como `INCONCLUSIVE`, y un proceso detenido conserva el presupuesto y la
 base de datos local.
 
-La verificación actual es de contratos, no de resultados de campaña: 139 tests
+La verificación actual es de contratos, no de resultados de campaña: 150 tests
 se ejecutan en host y en la imagen fijada, y la ruta nativa sintética comprueba
 lotes de tres frente a tres ejecuciones individuales y resuelve las 72 clases.
 Esto demuestra que el runner puede validar su mecánica; no demuestra que la
@@ -132,6 +132,11 @@ usando el runner `history-data`. Después se repite `prepare-phase` con el nombr
 simple del manifiesto VALIDATION y el `--grant-id` devuelto para crear el binding
 inmutable del snapshot. Antes de ejecutar el runner se exportan manualmente las
 rutas reales del manifiesto y del directorio que devuelve ese `--snapshot`:
+
+Los servicios `history-data` y `history` montan únicamente
+`search/control/` en `/lab-search-authority/control` como solo lectura. Así
+verifican el grant contra el estado y el reporte de fase canónicos; sin esa
+autoridad, VALIDATION y TEST fallan cerrados.
 
 ```sh
 export LAB_HISTORY_INPUT="<history_input-devuelto-por-prepare-phase>"
