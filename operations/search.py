@@ -53,6 +53,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -561,6 +562,58 @@ def _container_locked():
     return _Guard()
 
 
+def _migrate_failed_preselection_state(existing: dict, definition_hash: str,
+                                       manifest: dict, archive_name: str) -> dict:
+    """Adopta una definicion corregida sin borrar computo ya consumido."""
+    if "force" in existing:
+        raise ValueError("migracion bloqueada con campo force")
+    if str(existing.get("campaign_id")) != CAMPAIGN_ID:
+        raise ValueError("campaign_id existente inesperado")
+    if re.fullmatch(r"[0-9a-f]{64}", str(existing.get("definition_hash") or "")) is None:
+        raise ValueError("definition_hash previo invalido")
+    if str(existing.get("stage")) != "REGISTERED":
+        raise ValueError("migracion solo antes de congelar TRAIN")
+    attempts = existing.get("attempts")
+    native_runs = existing.get("native_runs")
+    if (not isinstance(attempts, list) or not attempts
+            or any(not isinstance(a, dict) or a.get("status") != "FAILED"
+                   for a in attempts)):
+        raise ValueError("migracion exige intentos tecnicos FAILED preservables")
+    if (not isinstance(native_runs, dict) or not native_runs
+            or any(not isinstance(r, dict) or r.get("status") != "FAILED"
+                   for r in native_runs.values())):
+        raise ValueError("migracion exige native_runs FAILED preservables")
+    blocked = (existing.get("train_ids"), existing.get("validation_ids"),
+               existing.get("test_candidate"), existing.get("test_grant_id"),
+               existing.get("test_grant"))
+    if (any(value not in (None, [], {}) for value in blocked)
+            or existing.get("test_consumed") is not False
+            or existing.get("grants") not in (None, {})
+            or existing.get("phase_reports") not in (None, {})
+            or existing.get("paper_ready") is not False):
+        raise ValueError("migracion bloqueada tras seleccion/grant/reporte")
+    consumed = existing.get("consumed")
+    if (type(consumed) is bool or not isinstance(consumed, (int, float))
+            or not math.isfinite(float(consumed)) or float(consumed) <= 0.0
+            or float(consumed) > BUDGET_SECONDS):
+        raise ValueError("consumo previo invalido para migracion")
+    from research.state import new_state
+
+    migrated = new_state(CAMPAIGN_ID, definition_hash)
+    migrated["input_id"] = manifest["input_id"]
+    migrated["created_at"] = manifest["created_at"]
+    migrated["consumed"] = float(consumed)
+    migrated["attempts"] = json.loads(json.dumps(attempts))
+    migrated["native_runs"] = json.loads(json.dumps(native_runs))
+    migrated["superseded_definitions"] = [{
+        "definition_hash": str(existing.get("definition_hash") or ""),
+        "input_id": str(existing.get("input_id") or ""),
+        "consumed": float(consumed),
+        "archive": str(archive_name),
+    }]
+    return migrated
+
+
 def prepare_search(code_root, storage_root, image_ref, train_snapshot: str) -> str:
     """Preflight HOST con snapshot explicito; crea fuente generada e input."""
     if not isinstance(image_ref, str) or image_ref.strip() != launch.PINNED_IMAGE:
@@ -669,27 +722,45 @@ def prepare_search(code_root, storage_root, image_ref, train_snapshot: str) -> s
         if "force" in manifest:
             raise ValueError("campo 'force' prohibido")
         out = store / "search" / "inputs" / f"search-input-{_slug()}-{manifest['input_id'][:8]}.json"
-        launch._atomic_create_new(out, manifest)
         state_path = store / "search" / "control" / f"campaign-{CAMPAIGN_ID}.json"
+        state_to_write = None
+        replace_state = False
         if state_path.is_file():
             try:
                 existing = json.loads(state_path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 raise ValueError(f"estado existente ilegible: {exc}") from exc
-            if str(existing.get("definition_hash")) != definition_hash:
-                raise ValueError(
-                    "definition_hash existente difiere (codigo/snapshot/fuente "
-                    "cambiados tras registro): bloque significativo, sin reset "
-                    "de budget; requiere nuevo spec aprobado")
             if str(existing.get("campaign_id")) != CAMPAIGN_ID:
                 raise ValueError("campaign_id existente inesperado")
+            if str(existing.get("definition_hash")) != definition_hash:
+                old_hash = str(existing.get("definition_hash") or "")
+                archive_name = (f"superseded-state-{old_hash[:8]}-"
+                                f"{definition_hash[:8]}.json")
+                state_to_write = _migrate_failed_preselection_state(
+                    existing, definition_hash, manifest, archive_name)
+                archive_path = state_path.parent / archive_name
+                if archive_path.is_file():
+                    try:
+                        archived = json.loads(archive_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError) as exc:
+                        raise ValueError(f"estado archivado ilegible: {exc}") from exc
+                    if archived != existing:
+                        raise ValueError("archivo de estado supersedido difiere")
+                else:
+                    launch._atomic_create_new(archive_path, existing)
+                replace_state = True
         else:
             from research.state import new_state
 
-            state = new_state(CAMPAIGN_ID, definition_hash)
-            state["input_id"] = manifest["input_id"]
-            state["created_at"] = manifest["created_at"]
-            launch._atomic_create_new(state_path, state)
+            state_to_write = new_state(CAMPAIGN_ID, definition_hash)
+            state_to_write["input_id"] = manifest["input_id"]
+            state_to_write["created_at"] = manifest["created_at"]
+        launch._atomic_create_new(out, manifest)
+        if state_to_write is not None:
+            if replace_state:
+                _save_state_atomic(state_path, state_to_write)
+            else:
+                launch._atomic_create_new(state_path, state_to_write)
     return str(out)
 
 
@@ -1101,6 +1172,10 @@ def _batch_names(variant_ids, batch_size=BATCH_MAX):
     return batches
 
 
+def _freqtrade_argv(command: str) -> list:
+    return [sys.executable, "-m", "freqtrade", str(command)]
+
+
 def _phase_guard(manifest_in: dict, state: dict, phase: str) -> None:
     if phase not in PHASES:
         raise ValueError(f"fase desconocida: {phase!r}")
@@ -1135,7 +1210,7 @@ def _native_argv_for_batch(window, fee, strategy_names, strategy_path,
         raise ValueError(f"timerange nativo invalido: {timerange!r}")
     seg_dir = str(Path(snap_root) / window["seg_dir"])
     argv = [
-        "freqtrade", "backtesting",
+        *_freqtrade_argv("backtesting"),
         "--config", CONTAINER_CONFIG,
         "--datadir", seg_dir,
         "--userdir", str(user_dir),
@@ -1785,7 +1860,7 @@ def _native_argv_lookahead(seg_dir: str, strategy_class: str, user_dir,
     if targeted < LOOKAHEAD_MIN_AMOUNT:
         raise ValueError(f"targeted {targeted} < minimo {LOOKAHEAD_MIN_AMOUNT}")
     return [
-        "freqtrade", "lookahead-analysis",
+        *_freqtrade_argv("lookahead-analysis"),
         "--config", CONTAINER_CONFIG,
         "--datadir", str(seg_dir),
         "--userdir", str(user_dir),
@@ -1807,7 +1882,7 @@ def _native_argv_recursive(seg_dir: str, strategy_class: str, user_dir,
     if tuple(RECURSIVE_WINDOWS) != (201, 400, 800, 1200):
         raise ValueError("ventanas recursive fuera de cierre 201/400/800/1200")
     return [
-        "freqtrade", "recursive-analysis",
+        *_freqtrade_argv("recursive-analysis"),
         "--config", CONTAINER_CONFIG,
         "--datadir", str(seg_dir),
         "--userdir", str(user_dir),
@@ -2302,7 +2377,7 @@ def _run_bias_gate(*, variant, class_name, seg_meta, snap_train_root,
     ref_user.mkdir(parents=True, exist_ok=True)
     ref_native.mkdir(parents=True, exist_ok=True)
     ref_argv = [
-        "freqtrade", "backtesting",
+        *_freqtrade_argv("backtesting"),
         "--config", CONTAINER_CONFIG,
         "--datadir", seg_dir,
         "--userdir", str(ref_user),

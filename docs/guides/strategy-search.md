@@ -107,13 +107,16 @@ candidata ni convierte una interrupción en éxito.
 El estado persistente es `search/control/campaign-btc-strategy-search-pr02.json`.
 Los intentos y reportes quedan en `search/sessions/`; un fallo técnico no se
 oculta como `INCONCLUSIVE`, y un proceso detenido conserva el presupuesto y la
-base de datos local.
+base de datos local. Si una corrección revisada cambia la definición antes de
+congelar TRAIN, `prepare` solo permite continuar cuando todos los intentos fueron
+`FAILED` y todavía no existen selecciones, grants ni reportes de fase; archiva el
+estado anterior y conserva íntegros intentos, ejecuciones y segundos consumidos.
 
-La verificación actual es de contratos, no de resultados de campaña: 150 tests
+La verificación actual es de contratos, no de resultados de campaña: 153 tests
 se ejecutan en host y en la imagen fijada, y la ruta nativa sintética comprueba
 lotes de tres frente a tres ejecuciones individuales y resuelve las 72 clases.
 Esto demuestra que el runner puede validar su mecánica; no demuestra que la
-búsqueda TRAIN se haya ejecutado ni que exista una candidata.
+búsqueda TRAIN se haya completado ni que exista una candidata.
 
 ## Apertura de VALIDATION y TEST
 

@@ -362,6 +362,16 @@ class MatrixFailureCase(unittest.TestCase):
 
 
 class ExecutorRoleCase(unittest.TestCase):
+    def test_all_native_tools_use_python_module_entrypoint(self):
+        backtesting = S._freqtrade_argv("backtesting")
+        lookahead = S._native_argv_lookahead(
+            "/data", "SpotCandidateV000", "/user", "20200101-20200201",
+            S.LOOKAHEAD_MIN_AMOUNT, "/out.csv")
+        recursive = S._native_argv_recursive(
+            "/data", "SpotCandidateV000", "/user", "20200101-20200201")
+        for argv in (backtesting, lookahead, recursive):
+            self.assertEqual(argv[1:3], ["-m", "freqtrade"])
+
     def test_val_role_uses_val_datadir_not_train(self):
         from research.campaign import generate_variants
         from research.state import new_state
@@ -400,6 +410,8 @@ class ExecutorRoleCase(unittest.TestCase):
             self.assertEqual(stats["failed"], 1)
             self.assertEqual(len(stub.calls), 1, "una ventana/fee/grupo => un Popen")
             argv = stub.calls[0]
+            self.assertEqual(argv[1:3], ["-m", "freqtrade"],
+                             "modulo Python conserva /opt/btc-lab en sys.path")
             datadir = argv[argv.index("--datadir") + 1]
             self.assertEqual(datadir, str(val_root / "seg00"),
                              "argv usa el snap_root VAL de la ventana")
@@ -469,6 +481,56 @@ class PrepareTamperCase(unittest.TestCase):
                 S.prepare_search(str(code), store, PINNED_IMAGE, base)
             self.assertEqual(state_path.read_bytes(), frozen,
                              "estado preparado intacto tras preflight fallido")
+
+    def test_failed_preselection_attempts_carry_to_new_definition(self):
+        from research.state import record_attempt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            code = _code_fixture(tmp)
+            store = str(Path(tmp) / "store")
+            snaps = Path(store) / "history" / "snapshots"
+            manifest = _snap_manifest(snaps, "snap-prep", [_seg_one()], b"W5", b"W1")
+            base = "train-snap-prep.json"
+            (snaps / base).write_text(json.dumps(manifest, sort_keys=True),
+                                      encoding="utf-8")
+            with _git_image():
+                S.prepare_search(str(code), store, PINNED_IMAGE, base)
+            state_path = (Path(store) / "search" / "control"
+                          / f"campaign-{S.CAMPAIGN_ID}.json")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            old_hash = state["definition_hash"]
+            record_attempt(state, "screen|failed-import", 7.25, "FAILED", "e" * 64)
+            state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+            target = code / "operations" / "search.py"
+            target.write_bytes(target.read_bytes() + b"\n# reviewed-fix\n")
+            with _git_image():
+                new_input = S.prepare_search(str(code), store, PINNED_IMAGE, base)
+            migrated = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(migrated["definition_hash"], old_hash)
+            self.assertEqual(migrated["consumed"], 7.25)
+            self.assertEqual(migrated["attempts"], state["attempts"])
+            self.assertEqual(migrated["native_runs"], state["native_runs"])
+            self.assertTrue(Path(new_input).is_file())
+            archives = list(state_path.parent.glob("superseded-state-*.json"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(json.loads(archives[0].read_text(encoding="utf-8")), state)
+
+    def test_preselection_migration_rejects_poisoned_state(self):
+        from research.state import new_state, record_attempt
+
+        base = new_state(S.CAMPAIGN_ID, "a" * 64)
+        record_attempt(base, "screen|failed", 1.0, "FAILED", "e" * 64)
+        manifest = {"input_id": "new", "created_at": "2026-09-22T00:00:00Z"}
+        for label, poison in (
+                ("force", {"force": True}),
+                ("hash traversal", {"definition_hash": "/../../escape"}),
+                ("native linkage", {"native_runs": {}})):
+            with self.subTest(label=label):
+                state = dict(base)
+                state.update(poison)
+                with self.assertRaises(ValueError):
+                    S._migrate_failed_preselection_state(
+                        state, "b" * 64, manifest, "archive.json")
 
 
 class StaleStateCase(unittest.TestCase):
